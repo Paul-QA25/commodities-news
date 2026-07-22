@@ -104,8 +104,8 @@ FEEDS = {
         "World Grain - Wheat": "https://www.world-grain.com/rss/topic/1351-wheat",
         "World Grain - Oilseeds": "https://www.world-grain.com/rss/topic/1344-oilseeds",
         "World Grain - Soybean": "https://www.world-grain.com/rss/topic/1350-soybean",
-        "BusinessLine Agribusiness": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
         "World Grain - Sunflower Seed": "https://www.world-grain.com/rss/topic/1923-sunflower-seed",
+        "BusinessLine Agribusiness": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
         "ChiniMandi (Sugar)": "https://www.chinimandi.com/all-news/feed",
         "Palm Oil Magazine": "https://www.palmoilmagazine.com/feed/",
         "ConfectioneryNews (Cocoa)": "https://www.confectionerynews.com/arc/outboundfeeds/rss/",
@@ -228,7 +228,8 @@ def print_digest(items) -> None:
 
 def write_html_digest(items) -> str:
     """Write a styled HTML digest, grouped into color-coded sections by
-    category, showing only headline + two-line summary (no links).
+    category, showing headline + two-line summary, each followed by an
+    inline "(Click to Read More)" link to the original article.
     Always writes a file for today, even with no new items, so the
     email step has something consistent to find.
     Returns the path to the file written."""
@@ -251,10 +252,27 @@ def write_html_digest(items) -> str:
             title = html.escape(item["title"])
             summary = html.escape(item.get("summary", ""))
             source = html.escape(item.get("source", ""))
-            summary_html = (
-                f'<div style="font-size:13px;color:#4b5563;line-height:1.5;margin-bottom:6px;">{summary}</div>'
-                if summary else ""
+            link = html.escape(item.get("link", ""), quote=True)
+
+            read_more = (
+                f' <a href="{link}" style="color:{color};text-decoration:underline;'
+                f'font-weight:600;white-space:nowrap;">(Click to Read More)</a>'
+                if link else ""
             )
+
+            if summary:
+                summary_html = (
+                    f'<div style="font-size:13px;color:#4b5563;line-height:1.5;margin-bottom:6px;">'
+                    f'{summary}{read_more}</div>'
+                )
+            elif link:
+                # No summary available - still offer the link on its own line.
+                summary_html = (
+                    f'<div style="font-size:13px;line-height:1.5;margin-bottom:6px;">{read_more.strip()}</div>'
+                )
+            else:
+                summary_html = ""
+
             cards.append(
                 f'<div style="background:#ffffff;border:1px solid #e5e7eb;border-left:4px solid {color};'
                 f'border-radius:6px;padding:14px 16px;margin-bottom:10px;">'
