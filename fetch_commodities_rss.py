@@ -66,6 +66,7 @@ def two_liner(text: str, max_chars: int = 200) -> str:
 FEEDS = {
     "Commodities": {
         "BusinessLine Commodities": "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
+        "BusinessLine Agribusiness": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
         "OilPrice.com": "https://oilprice.com/rss/main",
         "Nasdaq Commodities": "https://www.nasdaq.com/feed/rssoutbound?category=Commodities",
         "MarketWatch Top Stories": "https://feeds.marketwatch.com/marketwatch/topstories/",
