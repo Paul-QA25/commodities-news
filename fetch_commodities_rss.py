@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Daily fetcher for commodities RSS feeds:
-  - The Hindu BusinessLine (Commodities)
-  - OilPrice.com (Main feed)
+Daily fetcher for RSS feeds across 7 categories: Commodities, World News,
+India News, Agriculture, Energy, Weather & Climate, Financial Markets.
+(See the FEEDS dictionary below for the full source list per category.)
 
 What it does each run:
-  1. Downloads all configured feeds (see FEEDS dict below).
+  1. Downloads all configured feeds.
   2. Compares entries against a local "seen" list (seen_articles.json)
      so already-processed items aren't reported again.
-  3. Prints any new items (plain text, tagged by source) and appends
-     them to a log file (commodities_feed_log.jsonl), one JSON object
-     per line.
-  4. Writes a WhatsApp-ready plain-text digest file
-     (commodities_digest_YYYY-MM-DD.txt).
+  3. Logs new items to commodities_feed_log.jsonl (one JSON object per
+     line, includes links internally for audit purposes).
+  4. Writes a styled HTML digest (news_digest_YYYY-MM-DD.html): color-coded
+     sections by category, each item shown as headline + two-line summary
+     only (no links in the digest itself).
 
-To add more feeds later, just add another "Name": "url" entry to the
-FEEDS dictionary below.
+To add more feeds later, add a "Name": "url" entry inside the relevant
+category dict in FEEDS below. To add a whole new category, add a new
+top-level key to FEEDS plus a matching entry in CATEGORY_COLORS.
 
 Run manually:
     python3 fetch_commodities_rss.py
@@ -28,10 +29,15 @@ import html
 import json
 import os
 import re
+import socket
 import sys
 from datetime import datetime, timezone
 
 import feedparser
+
+# With many feeds configured, one slow/unresponsive server could otherwise
+# stall the whole run indefinitely. 15s is generous for a news RSS file.
+socket.setdefaulttimeout(15)
 
 
 def clean_html(raw_html: str) -> str:
@@ -46,9 +52,79 @@ def clean_html(raw_html: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+
+def two_liner(text: str, max_chars: int = 200) -> str:
+    """Reduce a summary to roughly two sentences / two lines worth of text."""
+    if not text:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    result = " ".join(sentences[:2]).strip()
+    if len(result) > max_chars:
+        result = result[:max_chars].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
+    return result
+
 FEEDS = {
-    "BusinessLine Commodities": "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
-    "OilPrice.com": "https://oilprice.com/rss/main",
+    "Commodities": {
+        "BusinessLine Commodities": "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
+        "OilPrice.com": "https://oilprice.com/rss/main",
+        "Nasdaq Commodities": "https://www.nasdaq.com/feed/rssoutbound?category=Commodities",
+        "MarketWatch Top Stories": "https://feeds.marketwatch.com/marketwatch/topstories/",
+        "Investing.com": "https://www.investing.com/rss/news.rss",
+        "FXStreet": "https://www.fxstreet.com/rss/news",
+        "Mining.com": "https://www.mining.com/feed/",
+        "Business Standard Commodities": "https://www.business-standard.com/rss/markets-commodities-106.rss",
+        "Financial Express Commodities": "https://www.financialexpress.com/market/commodities/feed/",
+        "Moneycontrol Top News": "https://www.moneycontrol.com/rss/MCtopnews.xml",
+    },
+    "World News": {
+        "BBC News World": "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
+    },
+    "India News": {
+        "NDTV Top Stories": "https://feeds.feedburner.com/ndtvnews-top-stories",
+        "The Hindu National": "https://www.thehindu.com/news/national/?service=rss",
+        "Times of India Top Stories": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+        "PIB (Press Information Bureau)": "https://www.pib.gov.in/ViewRss.aspx?reg=1&lang=1",
+    },
+    "Agriculture": {
+        "USDA News": "https://www.usda.gov/rss/latest.xml",
+        "USDA NASS News": "http://www.nass.usda.gov/rss/news.xml",
+        "USDA NASS Reports (WASDE/Crop Progress)": "http://www.nass.usda.gov/rss/reports.xml",
+        "IFPRI": "https://www.ifpri.org/rss.xml",
+        "CGIAR": "https://www.cgiar.org/feed/",
+        "Farm Progress": "https://www.farmprogress.com/rss.xml",
+        "AgWeb": "https://www.agweb.com/rss.xml",
+        "DTN Progressive Farmer": "https://www.dtnpf.com/agriculture/rss",
+        "Successful Farming": "https://www.agriculture.com/rss.xml",
+    },
+    "Energy": {
+        "EIA Today in Energy": "https://www.eia.gov/rss/todayinenergy.xml",
+        "EIA What's New": "https://www.eia.gov/rss/whatsnew.xml",
+        "EIA Petroleum": "https://www.eia.gov/rss/petroleum.xml",
+    },
+    "Weather & Climate": {
+        "NOAA News": "https://www.noaa.gov/rss.xml",
+        "NOAA Climate.gov": "https://www.climate.gov/feed.xml",
+        "CPC (ENSO/Drought)": "https://www.cpc.ncep.noaa.gov/products/rss.xml",
+        "NASA Earth Observatory": "https://earthobservatory.nasa.gov/feeds/image-of-the-day.rss",
+        "Copernicus Climate": "https://climate.copernicus.eu/rss.xml",
+    },
+    "Financial Markets": {
+        "Bloomberg Markets": "https://feeds.bloomberg.com/markets/news.rss",
+        "Bloomberg Economics": "https://feeds.bloomberg.com/economics/news.rss",
+        "Bloomberg Industries": "https://feeds.bloomberg.com/industries/news.rss",
+    },
+}
+
+# Accent color per category, used for the HTML digest section headers.
+CATEGORY_COLORS = {
+    "Commodities": "#B45309",       # amber
+    "World News": "#1D4ED8",        # blue
+    "India News": "#15803D",        # green
+    "Agriculture": "#65A30D",       # olive green
+    "Energy": "#C2410C",            # burnt orange
+    "Weather & Climate": "#0284C7", # sky blue
+    "Financial Markets": "#6D28D9", # purple
 }
 
 # Files are created next to this script when run as a .py file, so
@@ -78,30 +154,32 @@ def fetch_new_articles():
     seen = load_seen()
     new_items = []
 
-    for source_name, feed_url in FEEDS.items():
-        feed = feedparser.parse(feed_url)
+    for category, feeds_in_category in FEEDS.items():
+        for source_name, feed_url in feeds_in_category.items():
+            feed = feedparser.parse(feed_url)
 
-        if feed.bozo:
-            # bozo=True means the feed didn't parse perfectly; often still usable,
-            # but worth flagging so you notice if a source changes its feed format.
-            print(f"Warning: '{source_name}' feed had a parse issue: {feed.bozo_exception}", file=sys.stderr)
+            if feed.bozo:
+                # bozo=True means the feed didn't parse perfectly; often still usable,
+                # but worth flagging so you notice if a source changes its feed format.
+                print(f"Warning: '{source_name}' feed had a parse issue: {feed.bozo_exception}", file=sys.stderr)
 
-        if not feed.entries:
-            print(f"No entries returned for '{source_name}' - it may be empty, blocked, or unreachable.")
-            continue
+            if not feed.entries:
+                print(f"No entries returned for '{source_name}' - it may be empty, blocked, or unreachable.")
+                continue
 
-        for entry in feed.entries:
-            guid = entry.get("id") or entry.get("link")
-            if guid and guid not in seen:
-                new_items.append({
-                    "source": source_name,
-                    "title": clean_html(entry.get("title", "")),
-                    "link": entry.get("link", ""),
-                    "published": entry.get("published", ""),
-                    "summary": clean_html(entry.get("summary", "")),
-                    "guid": guid,
-                })
-                seen.add(guid)
+            for entry in feed.entries:
+                guid = entry.get("id") or entry.get("link")
+                if guid and guid not in seen:
+                    new_items.append({
+                        "category": category,
+                        "source": source_name,
+                        "title": clean_html(entry.get("title", "")),
+                        "link": entry.get("link", ""),  # kept for internal dedup/log only, not displayed
+                        "published": entry.get("published", ""),
+                        "summary": two_liner(clean_html(entry.get("summary", ""))),
+                        "guid": guid,
+                    })
+                    seen.add(guid)
 
     save_seen(seen)
     return new_items
@@ -120,46 +198,85 @@ def print_digest(items) -> None:
     print(f"\n{len(items)} new article(s) — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print("=" * 70)
     for i, item in enumerate(items, 1):
-        print(f"\n[{i}] ({item.get('source', 'Unknown')}) {item['title']}")
-        if item.get("published"):
-            print(f"    Published: {item['published']}")
+        print(f"\n[{i}] ({item.get('category', '')} / {item.get('source', 'Unknown')}) {item['title']}")
         if item.get("summary"):
             print(f"    {item['summary']}")
-        print(f"    Link: {item['link']}")
     print("\n" + "=" * 70)
 
 
-def write_txt_digest(items) -> str:
-    """Write a plain-text digest file suitable for sharing (e.g. on WhatsApp).
-    Always writes a file for today, even if there are no new items, so
-    automated delivery (e.g. daily email) has something consistent to find.
+def write_html_digest(items) -> str:
+    """Write a styled HTML digest, grouped into color-coded sections by
+    category, showing only headline + two-line summary (no links).
+    Always writes a file for today, even with no new items, so the
+    email step has something consistent to find.
     Returns the path to the file written."""
+    today_display = datetime.now(timezone.utc).strftime("%B %d, %Y")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    txt_path = os.path.join(BASE_DIR, f"commodities_digest_{today}.txt")
+    html_path = os.path.join(BASE_DIR, f"news_digest_{today}.html")
 
-    lines = []
-    lines.append("COMMODITIES NEWS DIGEST")
-    lines.append(f"{today}")
-    lines.append("-" * 40)
+    # Group items by category, preserving the category order defined in FEEDS.
+    by_category = {cat: [] for cat in FEEDS.keys()}
+    for item in items:
+        by_category.setdefault(item.get("category", "Other"), []).append(item)
 
-    if items:
-        for i, item in enumerate(items, 1):
-            lines.append("")
-            lines.append(f"{i}. [{item.get('source', 'Unknown')}] {item['title']}")
-            if item.get("summary"):
-                lines.append(item["summary"])
-            lines.append(item["link"])
-    else:
-        lines.append("")
-        lines.append("No new articles since yesterday.")
+    sections_html = []
+    for category, cat_items in by_category.items():
+        if not cat_items:
+            continue
+        color = CATEGORY_COLORS.get(category, "#374151")
+        cards = []
+        for item in cat_items:
+            title = html.escape(item["title"])
+            summary = html.escape(item.get("summary", ""))
+            source = html.escape(item.get("source", ""))
+            summary_html = (
+                f'<div style="font-size:13px;color:#4b5563;line-height:1.5;margin-bottom:6px;">{summary}</div>'
+                if summary else ""
+            )
+            cards.append(
+                f'<div style="background:#ffffff;border:1px solid #e5e7eb;border-left:4px solid {color};'
+                f'border-radius:6px;padding:14px 16px;margin-bottom:10px;">'
+                f'<div style="font-size:15px;font-weight:600;color:#111827;line-height:1.4;margin-bottom:4px;">{title}</div>'
+                f'{summary_html}'
+                f'<div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.03em;">{source}</div>'
+                f'</div>'
+            )
+        sections_html.append(
+            f'<div style="margin-bottom:26px;">'
+            f'<div style="background:{color};color:#ffffff;font-size:14px;font-weight:700;'
+            f'padding:8px 14px;border-radius:6px 6px 0 0;letter-spacing:0.02em;">'
+            f'{html.escape(category)} &nbsp;({len(cat_items)})</div>'
+            f'<div style="border:1px solid {color}22;border-top:none;padding:12px;background:#f9fafb;'
+            f'border-radius:0 0 6px 6px;">{"".join(cards)}</div>'
+            f'</div>'
+        )
 
-    lines.append("")
-    lines.append("-" * 40)
+    body_content = "".join(sections_html) if sections_html else (
+        '<div style="text-align:center;color:#6b7280;padding:40px 0;font-size:14px;">'
+        'No new articles since yesterday.</div>'
+    )
 
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    full_html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+  <div style="max-width:640px;margin:0 auto;padding:20px;">
+    <div style="text-align:center;margin-bottom:24px;">
+      <div style="font-size:20px;font-weight:800;color:#111827;">Daily News Digest</div>
+      <div style="font-size:13px;color:#6b7280;margin-top:2px;">{today_display}</div>
+    </div>
+    {body_content}
+    <div style="text-align:center;color:#9ca3af;font-size:11px;margin-top:20px;">
+      Automated digest &middot; {len(items)} new item(s) today
+    </div>
+  </div>
+</body>
+</html>"""
 
-    return txt_path
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(full_html)
+
+    return html_path
 
 
 def main():
@@ -169,8 +286,8 @@ def main():
         log_articles(new_items)
     else:
         print("No new articles since last run.")
-    txt_path = write_txt_digest(new_items)
-    print(f"\nPlain-text digest saved to: {txt_path}")
+    html_path = write_html_digest(new_items)
+    print(f"\nHTML digest saved to: {html_path}")
 
 
 if __name__ == "__main__":
