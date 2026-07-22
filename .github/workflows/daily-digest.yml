@@ -19,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -37,10 +37,15 @@ jobs:
         run: |
           FILE="commodities_digest_$(date -u +%Y-%m-%d).txt"
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          # Use a unique delimiter (not a plain "EOF") and force a trailing
+          # newline before it, so this can't break even if the file content
+          # ends without one, or happens to contain the word EOF anywhere.
+          DELIM="BODY_$(date -u +%s%N)"
           {
-            echo 'body<<EOF'
+            echo "body<<$DELIM"
             cat "$FILE"
-            echo 'EOF'
+            echo ""
+            echo "$DELIM"
           } >> "$GITHUB_OUTPUT"
 
       - name: Email the digest
