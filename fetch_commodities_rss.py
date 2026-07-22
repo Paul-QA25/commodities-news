@@ -157,7 +157,7 @@ def write_txt_digest(items) -> str:
     lines.append("-" * 40)
 
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write("\n".join(lines) + "\n")
 
     return txt_path
 
