@@ -1,12 +1,18 @@
 name: Daily Commodities RSS Digest
 
+# Runs automatically every day - no manual step required once this is
+# pushed to a GitHub repo. Also allows manual triggering from the
+# "Actions" tab if you ever want to force an early run.
 on:
   schedule:
+    # 03:30 UTC = 09:00 IST. Edit the two numbers "30 3" (minute hour)
+    # to change the time. Cron is always in UTC regardless of your
+    # local timezone.
     - cron: "30 3 * * *"
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: write  # needed so the workflow can commit the digest back
 
 jobs:
   fetch-digest:
@@ -26,10 +32,36 @@ jobs:
       - name: Run RSS fetch script
         run: python3 fetch_commodities_rss.py
 
+      - name: Locate today's digest file
+        id: digest
+        run: |
+          FILE="commodities_digest_$(date -u +%Y-%m-%d).txt"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          {
+            echo 'body<<EOF'
+            cat "$FILE"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Email the digest
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Commodities Digest - ${{ steps.digest.outputs.file }}"
+          to: ${{ secrets.MAIL_TO }}
+          from: Commodities Digest Bot
+          body: ${{ steps.digest.outputs.body }}
+          attachments: ${{ steps.digest.outputs.file }}
+
       - name: Commit new digest / log files back to the repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add commodities_digest_*.txt commodities_feed_log.jsonl seen_articles.json
+          # Only commit if something actually changed (avoids empty commits
+          # on days with no new articles).
           git diff --staged --quiet || git commit -m "Daily digest: $(date -u +'%Y-%m-%d')"
           git push
