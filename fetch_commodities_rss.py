@@ -156,30 +156,37 @@ def fetch_new_articles():
 
     for category, feeds_in_category in FEEDS.items():
         for source_name, feed_url in feeds_in_category.items():
-            feed = feedparser.parse(feed_url)
+            try:
+                feed = feedparser.parse(feed_url)
 
-            if feed.bozo:
-                # bozo=True means the feed didn't parse perfectly; often still usable,
-                # but worth flagging so you notice if a source changes its feed format.
-                print(f"Warning: '{source_name}' feed had a parse issue: {feed.bozo_exception}", file=sys.stderr)
+                if feed.bozo:
+                    # bozo=True means the feed didn't parse perfectly; often still usable,
+                    # but worth flagging so you notice if a source changes its feed format.
+                    print(f"Warning: '{source_name}' feed had a parse issue: {feed.bozo_exception}", file=sys.stderr)
 
-            if not feed.entries:
-                print(f"No entries returned for '{source_name}' - it may be empty, blocked, or unreachable.")
+                if not feed.entries:
+                    print(f"No entries returned for '{source_name}' - it may be empty, blocked, or unreachable.")
+                    continue
+
+                for entry in feed.entries:
+                    guid = entry.get("id") or entry.get("link")
+                    if guid and guid not in seen:
+                        new_items.append({
+                            "category": category,
+                            "source": source_name,
+                            "title": clean_html(entry.get("title", "")),
+                            "link": entry.get("link", ""),  # kept for internal dedup/log only, not displayed
+                            "published": entry.get("published", ""),
+                            "summary": two_liner(clean_html(entry.get("summary", ""))),
+                            "guid": guid,
+                        })
+                        seen.add(guid)
+            except Exception as exc:
+                # One misbehaving feed (malformed response, unexpected data
+                # shape, connection error not caught by feedparser itself,
+                # etc.) must never take down the whole run. Log it and move on.
+                print(f"ERROR: '{source_name}' failed unexpectedly and was skipped: {exc}", file=sys.stderr)
                 continue
-
-            for entry in feed.entries:
-                guid = entry.get("id") or entry.get("link")
-                if guid and guid not in seen:
-                    new_items.append({
-                        "category": category,
-                        "source": source_name,
-                        "title": clean_html(entry.get("title", "")),
-                        "link": entry.get("link", ""),  # kept for internal dedup/log only, not displayed
-                        "published": entry.get("published", ""),
-                        "summary": two_liner(clean_html(entry.get("summary", ""))),
-                        "guid": guid,
-                    })
-                    seen.add(guid)
 
     save_seen(seen)
     return new_items
