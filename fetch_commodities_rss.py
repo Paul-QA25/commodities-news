@@ -66,7 +66,6 @@ def two_liner(text: str, max_chars: int = 200) -> str:
 FEEDS = {
     "Commodities": {
         "BusinessLine Commodities": "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
-        "BusinessLine Agribusiness": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
         "OilPrice.com": "https://oilprice.com/rss/main",
         "Nasdaq Commodities": "https://www.nasdaq.com/feed/rssoutbound?category=Commodities",
         "MarketWatch Top Stories": "https://feeds.marketwatch.com/marketwatch/topstories/",
@@ -98,6 +97,20 @@ FEEDS = {
         "DTN Progressive Farmer": "https://www.dtnpf.com/agriculture/rss",
         "Successful Farming": "https://www.agriculture.com/rss.xml",
     },
+    # Commodity-specific trade press: Grains, Oilseeds, Sugar, Soy/Sunflower
+    # oil, Palm Oil, Cocoa, Coffee (World & India). Tea intentionally
+    # omitted - no confirmed working feed found; add one if you find it.
+    "Agri Commodities": {
+        "World Grain - Wheat": "https://www.world-grain.com/rss/topic/1351-wheat",
+        "World Grain - Oilseeds": "https://www.world-grain.com/rss/topic/1344-oilseeds",
+        "World Grain - Soybean": "https://www.world-grain.com/rss/topic/1350-soybean",
+        "BusinessLine Agribusiness": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
+        "World Grain - Sunflower Seed": "https://www.world-grain.com/rss/topic/1923-sunflower-seed",
+        "ChiniMandi (Sugar)": "https://www.chinimandi.com/all-news/feed",
+        "Palm Oil Magazine": "https://www.palmoilmagazine.com/feed/",
+        "ConfectioneryNews (Cocoa)": "https://www.confectionerynews.com/arc/outboundfeeds/rss/",
+        "Daily Coffee News": "https://dailycoffeenews.com/feed",
+    },
     "Energy": {
         "EIA Today in Energy": "https://www.eia.gov/rss/todayinenergy.xml",
         "EIA What's New": "https://www.eia.gov/rss/whatsnew.xml",
@@ -123,6 +136,7 @@ CATEGORY_COLORS = {
     "World News": "#1D4ED8",        # blue
     "India News": "#15803D",        # green
     "Agriculture": "#65A30D",       # olive green
+    "Agri Commodities": "#A16207",  # dark gold
     "Energy": "#C2410C",            # burnt orange
     "Weather & Climate": "#0284C7", # sky blue
     "Financial Markets": "#6D28D9", # purple
