@@ -32,21 +32,9 @@ jobs:
       - name: Run RSS fetch script
         run: python3 fetch_commodities_rss.py
 
-      - name: Locate today's digest file
+      - name: Determine today's digest filename
         id: digest
-        run: |
-          FILE="commodities_digest_$(date -u +%Y-%m-%d).txt"
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-          # Use a unique delimiter (not a plain "EOF") and force a trailing
-          # newline before it, so this can't break even if the file content
-          # ends without one, or happens to contain the word EOF anywhere.
-          DELIM="BODY_$(date -u +%s%N)"
-          {
-            echo "body<<$DELIM"
-            cat "$FILE"
-            echo ""
-            echo "$DELIM"
-          } >> "$GITHUB_OUTPUT"
+        run: echo "file=news_digest_$(date -u +%Y-%m-%d).html" >> "$GITHUB_OUTPUT"
 
       - name: Email the digest
         uses: dawidd6/action-send-mail@v3
@@ -55,17 +43,38 @@ jobs:
           server_port: 465
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Commodities Digest - ${{ steps.digest.outputs.file }}"
+          subject: "Daily News Digest - ${{ steps.digest.outputs.file }}"
           to: ${{ secrets.MAIL_TO }}
-          from: Commodities Digest Bot
-          body: ${{ steps.digest.outputs.body }}
-          attachments: ${{ steps.digest.outputs.file }}
+          from: News Digest Bot
+          # Reads the HTML file's contents directly as the email body -
+          # no attachment, since the digest itself is what you're reading.
+          html_body: file://${{ steps.digest.outputs.file }}
+          content_type: text/html
+
+      - name: Clean up old digest files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # One-time (and ongoing safety) cleanup: remove any leftover .txt
+          # digests from before the switch to HTML. --ignore-unmatch means
+          # this is a safe no-op once none remain, rather than failing.
+          git rm --ignore-unmatch -f commodities_digest_*.txt
+
+          # Keep only the most recent N daily HTML digests so the repo
+          # doesn't accumulate one file per day forever. Raise/lower this
+          # number to keep more or less history.
+          KEEP=30
+          OLD_FILES=$(ls -1 news_digest_*.html 2>/dev/null | sort | head -n -"$KEEP" || true)
+          if [ -n "$OLD_FILES" ]; then
+            git rm -f $OLD_FILES
+          fi
 
       - name: Commit new digest / log files back to the repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add commodities_digest_*.txt commodities_feed_log.jsonl seen_articles.json
+          git add news_digest_*.html commodities_feed_log.jsonl seen_articles.json
           # Only commit if something actually changed (avoids empty commits
           # on days with no new articles).
           git diff --staged --quiet || git commit -m "Daily digest: $(date -u +'%Y-%m-%d')"
