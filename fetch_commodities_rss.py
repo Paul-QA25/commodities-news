@@ -69,10 +69,10 @@ FEEDS = {
         "OilPrice.com": "https://oilprice.com/rss/main",
         "Nasdaq Commodities": "https://www.nasdaq.com/feed/rssoutbound?category=Commodities",
         "MarketWatch Top Stories": "https://feeds.marketwatch.com/marketwatch/topstories/",
-        "Investing.com": "https://www.investing.com/rss/news.rss",
+        "Investing.com India (Commodities)": "https://in.investing.com/rss/commodities.rss",
         "FXStreet": "https://www.fxstreet.com/rss/news",
         "Mining.com": "https://www.mining.com/feed/",
-        "Business Standard Commodities": "https://www.business-standard.com/rss/markets-commodities-106.rss",
+        "Business Standard Commodities": "https://www.business-standard.com/rss/markets/commodities-10608.rss",
         "Financial Express Commodities": "https://www.financialexpress.com/market/commodities/feed/",
         "Moneycontrol Top News": "https://www.moneycontrol.com/rss/MCtopnews.xml",
     },
@@ -87,6 +87,7 @@ FEEDS = {
         "PIB (Press Information Bureau)": "https://www.pib.gov.in/ViewRss.aspx?reg=1&lang=1",
     },
     "Agriculture": {
+        "BusinessLine Ag": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
         "USDA News": "https://www.usda.gov/rss/latest.xml",
         "USDA NASS News": "http://www.nass.usda.gov/rss/news.xml",
         "USDA NASS Reports (WASDE/Crop Progress)": "http://www.nass.usda.gov/rss/reports.xml",
@@ -105,7 +106,6 @@ FEEDS = {
         "World Grain - Oilseeds": "https://www.world-grain.com/rss/topic/1344-oilseeds",
         "World Grain - Soybean": "https://www.world-grain.com/rss/topic/1350-soybean",
         "World Grain - Sunflower Seed": "https://www.world-grain.com/rss/topic/1923-sunflower-seed",
-        "BusinessLine Agribusiness": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
         "ChiniMandi (Sugar)": "https://www.chinimandi.com/all-news/feed",
         "Palm Oil Magazine": "https://www.palmoilmagazine.com/feed/",
         "ConfectioneryNews (Cocoa)": "https://www.confectionerynews.com/arc/outboundfeeds/rss/",
@@ -319,6 +319,120 @@ def write_html_digest(items) -> str:
     return html_path
 
 
+def write_pdf_digest(items) -> str:
+    """Write a PDF version of the digest, mirroring the HTML digest:
+    color-coded section headers per category, headline + two-line summary,
+    each followed by a clickable "(Click to Read More)" link.
+    Always writes a file for today, even with no new items.
+    Returns the path to the file written."""
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    )
+
+    today_display = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pdf_path = os.path.join(BASE_DIR, f"news_digest_{today}.pdf")
+
+    by_category = {cat: [] for cat in FEEDS.keys()}
+    for item in items:
+        by_category.setdefault(item.get("category", "Other"), []).append(item)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "DigestTitle", parent=styles["Title"], fontSize=20, alignment=TA_CENTER,
+        textColor=rl_colors.HexColor("#111827"),
+    )
+    date_style = ParagraphStyle(
+        "DigestDate", parent=styles["Normal"], fontSize=10, alignment=TA_CENTER,
+        textColor=rl_colors.HexColor("#6b7280"), spaceAfter=18,
+    )
+    section_header_style = ParagraphStyle(
+        "SectionHeader", parent=styles["Normal"], fontSize=12,
+        textColor=rl_colors.white, fontName="Helvetica-Bold",
+    )
+    headline_style = ParagraphStyle(
+        "Headline", parent=styles["Normal"], fontSize=11, leading=14,
+        spaceAfter=2, textColor=rl_colors.HexColor("#111827"), fontName="Helvetica-Bold",
+    )
+    summary_style = ParagraphStyle(
+        "Summary", parent=styles["Normal"], fontSize=9.5, leading=13,
+        textColor=rl_colors.HexColor("#4b5563"), spaceAfter=3,
+    )
+    source_style = ParagraphStyle(
+        "Source", parent=styles["Normal"], fontSize=7.5,
+        textColor=rl_colors.HexColor("#9ca3af"), spaceAfter=12,
+    )
+    footer_style = ParagraphStyle(
+        "Footer", parent=styles["Normal"], fontSize=8, alignment=TA_CENTER,
+        textColor=rl_colors.HexColor("#9ca3af"), spaceBefore=16,
+    )
+
+    story = [
+        Paragraph("Daily News Digest", title_style),
+        Paragraph(today_display, date_style),
+    ]
+
+    for category, cat_items in by_category.items():
+        if not cat_items:
+            continue
+        color_hex = CATEGORY_COLORS.get(category, "#374151")
+
+        header = Table(
+            [[Paragraph(f"{html.escape(category)}&nbsp;&nbsp;({len(cat_items)})", section_header_style)]],
+            colWidths=[6.9 * inch],
+        )
+        header.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), rl_colors.HexColor(color_hex)),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(header)
+        story.append(Spacer(1, 6))
+
+        for item in cat_items:
+            title = html.escape(item["title"])
+            summary = html.escape(item.get("summary", ""))
+            source = html.escape(item.get("source", "")).upper()
+            link = html.escape(item.get("link", ""), quote=True)
+
+            read_more = (
+                f'<link href="{link}" color="{color_hex}"><b>(Click to Read More)</b></link>'
+                if link else ""
+            )
+
+            story.append(Paragraph(title, headline_style))
+            if summary and read_more:
+                story.append(Paragraph(f"{summary} {read_more}", summary_style))
+            elif read_more:
+                story.append(Paragraph(read_more, summary_style))
+            elif summary:
+                story.append(Paragraph(summary, summary_style))
+            story.append(Paragraph(source, source_style))
+
+        story.append(Spacer(1, 10))
+
+    if len(story) == 2:  # only the title/date were added - no category sections
+        story.append(Paragraph("No new articles since yesterday.", styles["Normal"]))
+
+    story.append(Paragraph(f"Automated digest &middot; {len(items)} new item(s) today", footer_style))
+
+    doc = SimpleDocTemplate(
+        pdf_path, pagesize=letter,
+        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+    )
+    doc.build(story)
+
+    return pdf_path
+
+
 def main():
     new_items = fetch_new_articles()
     if new_items:
@@ -327,7 +441,9 @@ def main():
     else:
         print("No new articles since last run.")
     html_path = write_html_digest(new_items)
+    pdf_path = write_pdf_digest(new_items)
     print(f"\nHTML digest saved to: {html_path}")
+    print(f"PDF digest saved to: {pdf_path}")
 
 
 if __name__ == "__main__":
