@@ -535,18 +535,43 @@ def write_pdf_digest(items) -> str:
 # --------------------------------------------------------------------------
 # Email
 # --------------------------------------------------------------------------
+def header_safe(value: str) -> str:
+    """Strip CR/LF from anything going into a mail header.
+
+    Secrets pasted into GitHub frequently carry stray newlines, and the email
+    module raises ValueError rather than cleaning them up. Header injection is
+    the reason it's strict, so we remove them rather than pass them through.
+    """
+    return re.sub(r"[\r\n]+", " ", value).strip()
+
+
+def split_recipients(raw: str) -> list[str]:
+    """Accept addresses separated by commas, semicolons, or line breaks."""
+    candidates = [part.strip(" \t\"'<>") for part in re.split(r"[,;\s]+", raw)]
+    seen, result = set(), []
+    for address in candidates:
+        if "@" in address and address not in seen:
+            seen.add(address)
+            result.append(address)
+    return result
+
+
 def smtp_config() -> tuple[dict | None, str | None]:
     """Read SMTP settings from the environment.
     Returns (config, reason_it_is_unusable)."""
-    user = os.environ.get("SMTP_USER", "").strip()
+    user = header_safe(os.environ.get("SMTP_USER", ""))
     password = os.environ.get("SMTP_PASS", "").strip()
-    recipients = [a.strip() for a in os.environ.get("MAIL_TO", "").split(",") if a.strip()]
+    raw_recipients = os.environ.get("MAIL_TO", "")
+    recipients = split_recipients(raw_recipients)
 
     missing = [name for name, value in
-               (("SMTP_USER", user), ("SMTP_PASS", password), ("MAIL_TO", recipients))
+               (("SMTP_USER", user), ("SMTP_PASS", password), ("MAIL_TO", raw_recipients.strip()))
                if not value]
     if missing:
         return None, f"not configured (missing {', '.join(missing)})"
+
+    if not recipients:
+        return None, f"MAIL_TO has no usable address in {raw_recipients.strip()!r}"
 
     # GitHub Actions substitutes an empty string for an undefined `vars.X`, so
     # `os.environ.get(name, default)` would hand back "" instead of the default.
@@ -562,16 +587,16 @@ def smtp_config() -> tuple[dict | None, str | None]:
         "port": port,
         "user": user,
         "password": password,
-        "sender": os.environ.get("MAIL_FROM", "").strip() or user,
+        "sender": header_safe(os.environ.get("MAIL_FROM", "")) or user,
         "recipients": recipients,
     }, None
 
 
 def build_message(cfg: dict, subject: str, html_body: str, attachments=()) -> EmailMessage:
     message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = cfg["sender"]
-    message["To"] = ", ".join(cfg["recipients"])
+    message["Subject"] = header_safe(subject)
+    message["From"] = header_safe(cfg["sender"])
+    message["To"] = header_safe(", ".join(cfg["recipients"]))
 
     # Plain-text fallback first, then the HTML alternative. Clients that can't
     # render HTML (and most spam filters) want to see both.
