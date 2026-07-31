@@ -1,60 +1,155 @@
 #!/usr/bin/env python3
 """
-Daily fetcher for RSS feeds across 7 categories: Commodities, World News,
-India News, Agriculture, Energy, Weather & Climate, Financial Markets.
-(See the FEEDS dictionary below for the full source list per category.)
+Daily news digest — focused edition.
 
-What it does each run:
-  1. Downloads all configured feeds.
-  2. Compares entries against a local "seen" list (seen_articles.json)
-     so already-processed items aren't reported again.
-  3. Logs new items to commodities_feed_log.jsonl (one JSON object per
-     line, includes links internally for audit purposes).
-  4. Writes a styled HTML digest (news_digest_YYYY-MM-DD.html): color-coded
-     sections by category, each item shown as headline + two-line summary
-     only (no links in the digest itself).
+Categories (deliberately small, curated sources only):
+    1. Agri Commodities   - global grains, oilseeds, softs
+    2. India Agriculture  - Indian crops, monsoon, MSP, policy
+    3. Precious Metals    - gold/silver mining, supply, price drivers
+    4. Bullion            - physical gold/silver trade, imports, MCX/IBJA
+    5. Global Macro       - Fed, inflation, rates, currencies
 
-To add more feeds later, add a "Name": "url" entry inside the relevant
-category dict in FEEDS below. To add a whole new category, add a new
-top-level key to FEEDS plus a matching entry in CATEGORY_COLORS.
+Outputs (written next to this script):
+    news_digest_YYYY-MM-DD.html   styled digest, one card per story
+    news_digest_YYYY-MM-DD.pdf    same content as PDF (optional)
+    news_feed_log.jsonl           append-only audit log
+    seen_articles.json            dedup state, auto-pruned
 
-Run manually:
-    python3 fetch_commodities_rss.py
+Usage:
+    python3 fetch_news_rss.py            # normal run
+    python3 fetch_news_rss.py --check    # test every feed, print status, exit
+    python3 fetch_news_rss.py --reset    # forget history, start fresh
 
-Automate it (see notes at the bottom of this file for cron / Task
-Scheduler / systemd examples).
+Dependencies:
+    pip install feedparser reportlab      # reportlab optional (PDF only)
 """
 
+import argparse
+import gzip
 import html
 import json
 import os
 import re
-import socket
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-import feedparser
+try:
+    import feedparser
+except ModuleNotFoundError:
+    sys.exit("feedparser is not installed. Run: pip install feedparser")
 
-# With many feeds configured, one slow/unresponsive server could otherwise
-# stall the whole run indefinitely. 15s is generous for a news RSS file.
-socket.setdefaulttimeout(15)
+
+# --------------------------------------------------------------------------
+# Tunables
+# --------------------------------------------------------------------------
+REQUEST_TIMEOUT = 20        # seconds per HTTP attempt
+RETRIES = 2                 # attempts per feed before giving up
+MAX_PER_FEED = 6            # newest N items taken from any single feed
+MAX_PER_CATEGORY = 12       # hard cap per category in the digest
+MAX_AGE_DAYS = 3            # ignore anything older than this
+SEEN_RETENTION_DAYS = 45    # how long a story stays in the dedup memory
+
+# Many publishers return 403 to Python's default user agent. Sending a normal
+# browser UA is what makes the difference between "no entries returned" and a
+# working feed — this was the main reason the old script came back empty.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
-def clean_html(raw_html: str) -> str:
-    """Strip HTML tags and decode entities, returning plain text."""
-    if not raw_html:
+def gnews(query: str) -> str:
+    """Build a Google News RSS URL.
+
+    These are used only where no publisher offers a stable topic feed. They are
+    not a source in themselves — every item links through to a real publisher
+    (Reuters, Business Standard, Mint, Economic Times, Bloomberg, etc.), and the
+    publisher name is shown on each card.
+    """
+    from urllib.parse import quote_plus
+    return (
+        f"https://news.google.com/rss/search?q={quote_plus(query)}"
+        "&hl=en-IN&gl=IN&ceid=IN:en"
+    )
+
+
+FEEDS = {
+    "Agri Commodities": {
+        # Verified working, primary source: USDA's own release feeds.
+        "USDA NASS Reports": "https://www.nass.usda.gov/rss/reports.xml",
+        "USDA NASS News": "https://www.nass.usda.gov/rss/news.xml",
+        "Grains & Oilseeds Wire": gnews(
+            "wheat OR corn OR soybean OR palm oil prices market when:2d"
+        ),
+    },
+    "India Agriculture": {
+        "BusinessLine Agri-Business":
+            "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
+        "India Crop & Policy Wire": gnews(
+            "India agriculture monsoon OR sowing OR MSP OR foodgrain when:2d"
+        ),
+    },
+    "Precious Metals": {
+        # Verified working.
+        "Mining.com": "https://www.mining.com/feed/",
+        "Gold & Silver Wire": gnews(
+            "gold price OR silver price OR precious metals when:2d"
+        ),
+    },
+    "Bullion": {
+        "India Bullion Wire": gnews(
+            "India gold imports OR bullion OR MCX gold OR jewellers demand when:2d"
+        ),
+    },
+    "Global Macro": {
+        # Verified working, primary source: the Fed's own feeds.
+        "Fed Monetary Policy": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+        "Fed Speeches & Testimony":
+            "https://www.federalreserve.gov/feeds/speeches_and_testimony.xml",
+        "Macro & Rates Wire": gnews(
+            "inflation OR central bank OR interest rates OR dollar index when:2d"
+        ),
+    },
+}
+
+CATEGORY_COLORS = {
+    "Agri Commodities": "#65A30D",   # olive
+    "India Agriculture": "#15803D",  # green
+    "Precious Metals": "#B45309",    # amber
+    "Bullion": "#A16207",            # dark gold
+    "Global Macro": "#6D28D9",       # purple
+}
+
+try:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:                     # notebooks have no __file__
+    BASE_DIR = os.getcwd()
+
+SEEN_FILE = os.path.join(BASE_DIR, "seen_articles.json")
+LOG_FILE = os.path.join(BASE_DIR, "news_feed_log.jsonl")
+
+
+# --------------------------------------------------------------------------
+# Text helpers
+# --------------------------------------------------------------------------
+def clean_html(raw: str) -> str:
+    """Strip tags, decode entities, collapse whitespace."""
+    if not raw:
         return ""
-    # Remove tags
-    text = re.sub(r"<[^>]+>", " ", raw_html)
-    # Decode entities like &amp; &nbsp; etc.
+    text = re.sub(r"<[^>]+>", " ", raw)
     text = html.unescape(text)
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def two_liner(text: str, max_chars: int = 200) -> str:
-    """Reduce a summary to roughly two sentences / two lines worth of text."""
+    """Trim a summary to roughly two sentences."""
     if not text:
         return ""
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
@@ -63,327 +158,328 @@ def two_liner(text: str, max_chars: int = 200) -> str:
         result = result[:max_chars].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
     return result
 
-FEEDS = {
-    "Commodities": {
-        "BusinessLine Commodities": "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
-        "OilPrice.com": "https://oilprice.com/rss/main",
-        "Nasdaq Commodities": "https://www.nasdaq.com/feed/rssoutbound?category=Commodities",
-        "MarketWatch Top Stories": "https://feeds.marketwatch.com/marketwatch/topstories/",
-        "Investing.com India (Commodities)": "https://in.investing.com/rss/commodities.rss",
-        "FXStreet": "https://www.fxstreet.com/rss/news",
-        "Mining.com": "https://www.mining.com/feed/",
-        "Business Standard Commodities": "https://www.business-standard.com/rss/markets/commodities-10608.rss",
-        "Financial Express Commodities": "https://www.financialexpress.com/market/commodities/feed/",
-        "Moneycontrol Top News": "https://www.moneycontrol.com/rss/MCtopnews.xml",
-    },
-    "World News": {
-        "BBC News World": "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
-    },
-    "India News": {
-        "NDTV Top Stories": "https://feeds.feedburner.com/ndtvnews-top-stories",
-        "The Hindu National": "https://www.thehindu.com/news/national/?service=rss",
-        "Times of India Top Stories": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-        "PIB (Press Information Bureau)": "https://www.pib.gov.in/ViewRss.aspx?reg=1&lang=1",
-    },
-    "Agriculture": {
-        "BusinessLine Ag": "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
-        "USDA News": "https://www.usda.gov/rss/latest.xml",
-        "USDA NASS News": "http://www.nass.usda.gov/rss/news.xml",
-        "USDA NASS Reports (WASDE/Crop Progress)": "http://www.nass.usda.gov/rss/reports.xml",
-        "IFPRI": "https://www.ifpri.org/rss.xml",
-        "CGIAR": "https://www.cgiar.org/feed/",
-        "Farm Progress": "https://www.farmprogress.com/rss.xml",
-        "AgWeb": "https://www.agweb.com/rss.xml",
-        "DTN Progressive Farmer": "https://www.dtnpf.com/agriculture/rss",
-        "Successful Farming": "https://www.agriculture.com/rss.xml",
-    },
-    # Commodity-specific trade press: Grains, Oilseeds, Sugar, Soy/Sunflower
-    # oil, Palm Oil, Cocoa, Coffee (World & India). Tea intentionally
-    # omitted - no confirmed working feed found; add one if you find it.
-    "Agri Commodities": {
-        "World Grain - Wheat": "https://www.world-grain.com/rss/topic/1351-wheat",
-        "World Grain - Oilseeds": "https://www.world-grain.com/rss/topic/1344-oilseeds",
-        "World Grain - Soybean": "https://www.world-grain.com/rss/topic/1350-soybean",
-        "World Grain - Sunflower Seed": "https://www.world-grain.com/rss/topic/1923-sunflower-seed",
-        "ChiniMandi (Sugar)": "https://www.chinimandi.com/all-news/feed",
-        "Palm Oil Magazine": "https://www.palmoilmagazine.com/feed/",
-        "ConfectioneryNews (Cocoa)": "https://www.confectionerynews.com/arc/outboundfeeds/rss/",
-        "Daily Coffee News": "https://dailycoffeenews.com/feed",
-    },
-    "Energy": {
-        "EIA Today in Energy": "https://www.eia.gov/rss/todayinenergy.xml",
-        "EIA What's New": "https://www.eia.gov/rss/whatsnew.xml",
-        "EIA Petroleum": "https://www.eia.gov/rss/petroleum.xml",
-    },
-    "Weather & Climate": {
-        "NOAA News": "https://www.noaa.gov/rss.xml",
-        "NOAA Climate.gov": "https://www.climate.gov/feed.xml",
-        "CPC (ENSO/Drought)": "https://www.cpc.ncep.noaa.gov/products/rss.xml",
-        "NASA Earth Observatory": "https://earthobservatory.nasa.gov/feeds/image-of-the-day.rss",
-        "Copernicus Climate": "https://climate.copernicus.eu/rss.xml",
-    },
-    "Financial Markets": {
-        "Bloomberg Markets": "https://feeds.bloomberg.com/markets/news.rss",
-        "Bloomberg Economics": "https://feeds.bloomberg.com/economics/news.rss",
-        "Bloomberg Industries": "https://feeds.bloomberg.com/industries/news.rss",
-    },
-}
 
-# Accent color per category, used for the HTML digest section headers.
-CATEGORY_COLORS = {
-    "Commodities": "#B45309",       # amber
-    "World News": "#1D4ED8",        # blue
-    "India News": "#15803D",        # green
-    "Agriculture": "#65A30D",       # olive green
-    "Agri Commodities": "#A16207",  # dark gold
-    "Energy": "#C2410C",            # burnt orange
-    "Weather & Climate": "#0284C7", # sky blue
-    "Financial Markets": "#6D28D9", # purple
-}
-
-# Files are created next to this script when run as a .py file, so
-# cron/Task Scheduler runs always find them. Jupyter notebooks don't
-# define __file__, so fall back to the current working directory there.
-try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    BASE_DIR = os.getcwd()
-SEEN_FILE = os.path.join(BASE_DIR, "seen_articles.json")
-LOG_FILE = os.path.join(BASE_DIR, "commodities_feed_log.jsonl")
+def normalise_title(title: str) -> str:
+    """Key used to spot the same story arriving from two different feeds."""
+    return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
 
 
-def load_seen() -> set:
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
-
-
-def save_seen(seen: set) -> None:
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(seen), f, indent=2)
-
-
-def fetch_new_articles():
-    seen = load_seen()
-    new_items = []
-
-    for category, feeds_in_category in FEEDS.items():
-        for source_name, feed_url in feeds_in_category.items():
+def entry_datetime(entry) -> datetime | None:
+    """Best-effort publication time as an aware UTC datetime."""
+    for key in ("published_parsed", "updated_parsed"):
+        parsed = entry.get(key)
+        if parsed:
             try:
-                feed = feedparser.parse(feed_url)
+                return datetime.fromtimestamp(time.mktime(parsed), tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return None
 
-                if feed.bozo:
-                    # bozo=True means the feed didn't parse perfectly; often still usable,
-                    # but worth flagging so you notice if a source changes its feed format.
-                    print(f"Warning: '{source_name}' feed had a parse issue: {feed.bozo_exception}", file=sys.stderr)
 
-                if not feed.entries:
-                    print(f"No entries returned for '{source_name}' - it may be empty, blocked, or unreachable.")
-                    continue
+# --------------------------------------------------------------------------
+# Dedup state
+# --------------------------------------------------------------------------
+def load_seen() -> dict:
+    """Return {guid: iso_timestamp}. Tolerates the old list format and
+    a corrupted file — neither should abort the run."""
+    if not os.path.exists(SEEN_FILE):
+        return {}
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Warning: could not read {SEEN_FILE} ({exc}); starting fresh.",
+              file=sys.stderr)
+        return {}
 
-                for entry in feed.entries:
-                    guid = entry.get("id") or entry.get("link")
-                    if guid and guid not in seen:
-                        new_items.append({
-                            "category": category,
-                            "source": source_name,
-                            "title": clean_html(entry.get("title", "")),
-                            "link": entry.get("link", ""),  # kept for internal dedup/log only, not displayed
-                            "published": entry.get("published", ""),
-                            "summary": two_liner(clean_html(entry.get("summary", ""))),
-                            "guid": guid,
-                        })
-                        seen.add(guid)
-            except Exception as exc:
-                # One misbehaving feed (malformed response, unexpected data
-                # shape, connection error not caught by feedparser itself,
-                # etc.) must never take down the whole run. Log it and move on.
-                print(f"ERROR: '{source_name}' failed unexpectedly and was skipped: {exc}", file=sys.stderr)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if isinstance(data, list):                      # legacy format
+        return {guid: now_iso for guid in data}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def save_seen(seen: dict) -> None:
+    """Prune old entries so the file can't grow without bound, then write."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SEEN_RETENTION_DAYS)
+    pruned = {}
+    for guid, stamp in seen.items():
+        try:
+            if datetime.fromisoformat(stamp) >= cutoff:
+                pruned[guid] = stamp
+        except (TypeError, ValueError):
+            pruned[guid] = datetime.now(timezone.utc).isoformat()
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(pruned, f, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Fetching
+# --------------------------------------------------------------------------
+def download(url: str) -> bytes:
+    """Fetch a feed with a browser user agent, timeout and one retry."""
+    last_error = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            with urlopen(Request(url, headers=HTTP_HEADERS),
+                         timeout=REQUEST_TIMEOUT) as response:
+                raw = response.read()
+                if response.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                return raw
+        except (HTTPError, URLError, OSError, gzip.BadGzipFile) as exc:
+            last_error = exc
+            if attempt < RETRIES:
+                time.sleep(2)
+    raise RuntimeError(last_error)
+
+
+def parse_feed(url: str):
+    """Download and parse. Returns (entries, error_string)."""
+    try:
+        raw = download(url)
+    except RuntimeError as exc:
+        return [], f"download failed: {exc}"
+
+    parsed = feedparser.parse(raw)
+    if not parsed.entries:
+        reason = getattr(parsed, "bozo_exception", None)
+        return [], f"no entries{f' ({reason})' if reason else ''}"
+    return parsed.entries, None
+
+
+def source_and_summary(entry, feed_name: str, title: str):
+    """Google News wraps items from other publishers, and its summaries are
+    just link markup. Credit the real publisher and drop the noise."""
+    publisher = None
+    source = entry.get("source")
+    if isinstance(source, dict):
+        publisher = source.get("title")
+
+    if publisher:
+        # Google News appends " - Publisher" to every headline; remove it.
+        if title.endswith(f" - {publisher}"):
+            title = title[: -len(f" - {publisher}")].strip()
+        return publisher, "", title
+
+    summary = two_liner(clean_html(entry.get("summary", "")))
+    # Some feeds echo the headline as the summary; that adds nothing.
+    if summary and normalise_title(summary).startswith(normalise_title(title)[:60]):
+        summary = ""
+    return feed_name, summary, title
+
+
+def fetch_new_articles() -> list:
+    seen = load_seen()
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=MAX_AGE_DAYS)
+    seen_titles = set()
+    collected = []
+
+    for category, feeds in FEEDS.items():
+        category_items = []
+
+        for feed_name, url in feeds.items():
+            entries, error = parse_feed(url)
+            if error:
+                print(f"  [skip] {category} / {feed_name}: {error}", file=sys.stderr)
                 continue
 
+            taken = 0
+            for entry in entries:
+                if taken >= MAX_PER_FEED:
+                    break
+
+                guid = entry.get("id") or entry.get("link")
+                if not guid or guid in seen:
+                    continue
+
+                published = entry_datetime(entry)
+                if published and published < cutoff:
+                    continue
+
+                title = clean_html(entry.get("title", ""))
+                if not title:
+                    continue
+
+                title_key = normalise_title(title)
+                if title_key in seen_titles:      # same story, another feed
+                    seen.setdefault(guid, now.isoformat())
+                    continue
+
+                publisher, summary, title = source_and_summary(entry, feed_name, title)
+
+                seen[guid] = now.isoformat()
+                seen_titles.add(title_key)
+                category_items.append({
+                    "category": category,
+                    "source": publisher,
+                    "title": title,
+                    "link": entry.get("link", ""),
+                    "published": entry.get("published", ""),
+                    "summary": summary,
+                    "guid": guid,
+                })
+                taken += 1
+
+            print(f"  [ok]   {category} / {feed_name}: {taken} new")
+
+        collected.extend(category_items[:MAX_PER_CATEGORY])
+
     save_seen(seen)
-    return new_items
+    return collected
 
 
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
 def log_articles(items) -> None:
+    stamp = datetime.now(timezone.utc).isoformat()
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         for item in items:
-            record = dict(item)
-            record["fetched_at"] = datetime.now(timezone.utc).isoformat()
+            record = dict(item, fetched_at=stamp)
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def print_digest(items) -> None:
-    """Print a clean, plain-text digest of articles to the console."""
-    print(f"\n{len(items)} new article(s) — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print("=" * 70)
-    for i, item in enumerate(items, 1):
-        print(f"\n[{i}] ({item.get('category', '')} / {item.get('source', 'Unknown')}) {item['title']}")
-        if item.get("summary"):
+    header = f"{len(items)} new article(s) — {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
+    print(f"\n{header}\n" + "=" * 70)
+    current = None
+    for item in items:
+        if item["category"] != current:
+            current = item["category"]
+            print(f"\n--- {current} ---")
+        print(f"\n  {item['title']}")
+        if item["summary"]:
             print(f"    {item['summary']}")
+        print(f"    [{item['source']}]")
     print("\n" + "=" * 70)
 
 
-def write_html_digest(items) -> str:
-    """Write a styled HTML digest, grouped into color-coded sections by
-    category, showing headline + two-line summary, each followed by an
-    inline "(Click to Read More)" link to the original article.
-    Always writes a file for today, even with no new items, so the
-    email step has something consistent to find.
-    Returns the path to the file written."""
-    today_display = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    html_path = os.path.join(BASE_DIR, f"news_digest_{today}.html")
-
-    # Group items by category, preserving the category order defined in FEEDS.
-    by_category = {cat: [] for cat in FEEDS.keys()}
+def group_by_category(items) -> dict:
+    grouped = {category: [] for category in FEEDS}
     for item in items:
-        by_category.setdefault(item.get("category", "Other"), []).append(item)
+        grouped.setdefault(item.get("category", "Other"), []).append(item)
+    return grouped
 
-    sections_html = []
-    for category, cat_items in by_category.items():
+
+def write_html_digest(items) -> str:
+    """Colour-coded HTML digest. Always written, even on an empty day, so the
+    downstream email/upload step always finds a file."""
+    today = datetime.now(timezone.utc)
+    path = os.path.join(BASE_DIR, f"news_digest_{today:%Y-%m-%d}.html")
+
+    sections = []
+    for category, cat_items in group_by_category(items).items():
         if not cat_items:
             continue
         color = CATEGORY_COLORS.get(category, "#374151")
         cards = []
         for item in cat_items:
             title = html.escape(item["title"])
-            summary = html.escape(item.get("summary", ""))
-            source = html.escape(item.get("source", ""))
-            link = html.escape(item.get("link", ""), quote=True)
+            summary = html.escape(item["summary"])
+            source = html.escape(item["source"])
+            link = html.escape(item["link"], quote=True)
 
             read_more = (
                 f' <a href="{link}" style="color:{color};text-decoration:underline;'
-                f'font-weight:600;white-space:nowrap;">(Click to Read More)</a>'
-                if link else ""
+                f'font-weight:600;white-space:nowrap;">(Read more)</a>' if link else ""
             )
-
-            if summary:
-                summary_html = (
-                    f'<div style="font-size:13px;color:#4b5563;line-height:1.5;margin-bottom:6px;">'
-                    f'{summary}{read_more}</div>'
-                )
-            elif link:
-                # No summary available - still offer the link on its own line.
-                summary_html = (
-                    f'<div style="font-size:13px;line-height:1.5;margin-bottom:6px;">{read_more.strip()}</div>'
-                )
-            else:
-                summary_html = ""
-
+            body = (
+                f'<div style="font-size:13px;color:#4b5563;line-height:1.5;'
+                f'margin-bottom:6px;">{summary}{read_more}</div>'
+                if (summary or link) else ""
+            )
             cards.append(
-                f'<div style="background:#ffffff;border:1px solid #e5e7eb;border-left:4px solid {color};'
-                f'border-radius:6px;padding:14px 16px;margin-bottom:10px;">'
-                f'<div style="font-size:15px;font-weight:600;color:#111827;line-height:1.4;margin-bottom:4px;">{title}</div>'
-                f'{summary_html}'
-                f'<div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.03em;">{source}</div>'
-                f'</div>'
+                f'<div style="background:#fff;border:1px solid #e5e7eb;'
+                f'border-left:4px solid {color};border-radius:6px;'
+                f'padding:14px 16px;margin-bottom:10px;">'
+                f'<div style="font-size:15px;font-weight:600;color:#111827;'
+                f'line-height:1.4;margin-bottom:4px;">{title}</div>{body}'
+                f'<div style="font-size:11px;color:#9ca3af;text-transform:uppercase;'
+                f'letter-spacing:0.03em;">{source}</div></div>'
             )
-        sections_html.append(
+
+        sections.append(
             f'<div style="margin-bottom:26px;">'
-            f'<div style="background:{color};color:#ffffff;font-size:14px;font-weight:700;'
-            f'padding:8px 14px;border-radius:6px 6px 0 0;letter-spacing:0.02em;">'
+            f'<div style="background:{color};color:#fff;font-size:14px;font-weight:700;'
+            f'padding:8px 14px;border-radius:6px 6px 0 0;">'
             f'{html.escape(category)} &nbsp;({len(cat_items)})</div>'
-            f'<div style="border:1px solid {color}22;border-top:none;padding:12px;background:#f9fafb;'
-            f'border-radius:0 0 6px 6px;">{"".join(cards)}</div>'
-            f'</div>'
+            f'<div style="border:1px solid {color}22;border-top:none;padding:12px;'
+            f'background:#f9fafb;border-radius:0 0 6px 6px;">{"".join(cards)}</div></div>'
         )
 
-    body_content = "".join(sections_html) if sections_html else (
+    body_content = "".join(sections) or (
         '<div style="text-align:center;color:#6b7280;padding:40px 0;font-size:14px;">'
-        'No new articles since yesterday.</div>'
+        'No new articles since the last run.</div>'
     )
 
-    full_html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;
+font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
   <div style="max-width:640px;margin:0 auto;padding:20px;">
     <div style="text-align:center;margin-bottom:24px;">
-      <div style="font-size:20px;font-weight:800;color:#111827;">Daily News Digest</div>
-      <div style="font-size:13px;color:#6b7280;margin-top:2px;">{today_display}</div>
+      <div style="font-size:20px;font-weight:800;color:#111827;">Daily Market Digest</div>
+      <div style="font-size:13px;color:#6b7280;margin-top:2px;">{today:%B %d, %Y}</div>
     </div>
     {body_content}
     <div style="text-align:center;color:#9ca3af;font-size:11px;margin-top:20px;">
-      Automated digest &middot; {len(items)} new item(s) today
+      Automated digest &middot; {len(items)} item(s) today
     </div>
   </div>
-</body>
-</html>"""
-
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(full_html)
-
-    return html_path
+</body></html>""")
+    return path
 
 
 def write_pdf_digest(items) -> str:
-    """Write a PDF version of the digest, mirroring the HTML digest:
-    color-coded section headers per category, headline + two-line summary,
-    each followed by a clickable "(Click to Read More)" link.
-    Always writes a file for today, even with no new items.
-    Returns the path to the file written."""
+    """PDF mirror of the HTML digest. Requires reportlab; caller treats any
+    failure here as non-fatal."""
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.enums import TA_CENTER
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import inch
-    from reportlab.platypus import (
-        Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
-    )
+    from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer,
+                                    Table, TableStyle)
 
-    today_display = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    pdf_path = os.path.join(BASE_DIR, f"news_digest_{today}.pdf")
-
-    by_category = {cat: [] for cat in FEEDS.keys()}
-    for item in items:
-        by_category.setdefault(item.get("category", "Other"), []).append(item)
-
+    today = datetime.now(timezone.utc)
+    path = os.path.join(BASE_DIR, f"news_digest_{today:%Y-%m-%d}.pdf")
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "DigestTitle", parent=styles["Title"], fontSize=20, alignment=TA_CENTER,
-        textColor=rl_colors.HexColor("#111827"),
-    )
-    date_style = ParagraphStyle(
-        "DigestDate", parent=styles["Normal"], fontSize=10, alignment=TA_CENTER,
-        textColor=rl_colors.HexColor("#6b7280"), spaceAfter=18,
-    )
-    section_header_style = ParagraphStyle(
-        "SectionHeader", parent=styles["Normal"], fontSize=12,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
-    )
-    headline_style = ParagraphStyle(
-        "Headline", parent=styles["Normal"], fontSize=11, leading=14,
-        spaceAfter=2, textColor=rl_colors.HexColor("#111827"), fontName="Helvetica-Bold",
-    )
-    summary_style = ParagraphStyle(
-        "Summary", parent=styles["Normal"], fontSize=9.5, leading=13,
-        textColor=rl_colors.HexColor("#4b5563"), spaceAfter=3,
-    )
-    source_style = ParagraphStyle(
-        "Source", parent=styles["Normal"], fontSize=7.5,
-        textColor=rl_colors.HexColor("#9ca3af"), spaceAfter=12,
-    )
-    footer_style = ParagraphStyle(
-        "Footer", parent=styles["Normal"], fontSize=8, alignment=TA_CENTER,
-        textColor=rl_colors.HexColor("#9ca3af"), spaceBefore=16,
-    )
 
-    story = [
-        Paragraph("Daily News Digest", title_style),
-        Paragraph(today_display, date_style),
-    ]
+    def style(name, **kwargs):
+        return ParagraphStyle(name, parent=styles["Normal"], **kwargs)
 
-    for category, cat_items in by_category.items():
+    title_style = ParagraphStyle("T", parent=styles["Title"], fontSize=20,
+                                 alignment=TA_CENTER,
+                                 textColor=rl_colors.HexColor("#111827"))
+    date_style = style("D", fontSize=10, alignment=TA_CENTER, spaceAfter=18,
+                       textColor=rl_colors.HexColor("#6b7280"))
+    header_style = style("H", fontSize=12, fontName="Helvetica-Bold",
+                         textColor=rl_colors.white)
+    headline_style = style("HL", fontSize=11, leading=14, spaceAfter=2,
+                           fontName="Helvetica-Bold",
+                           textColor=rl_colors.HexColor("#111827"))
+    summary_style = style("S", fontSize=9.5, leading=13, spaceAfter=3,
+                          textColor=rl_colors.HexColor("#4b5563"))
+    source_style = style("Src", fontSize=7.5, spaceAfter=12,
+                         textColor=rl_colors.HexColor("#9ca3af"))
+    footer_style = style("F", fontSize=8, alignment=TA_CENTER, spaceBefore=16,
+                         textColor=rl_colors.HexColor("#9ca3af"))
+
+    story = [Paragraph("Daily Market Digest", title_style),
+             Paragraph(f"{today:%B %d, %Y}", date_style)]
+
+    for category, cat_items in group_by_category(items).items():
         if not cat_items:
             continue
         color_hex = CATEGORY_COLORS.get(category, "#374151")
-
         header = Table(
-            [[Paragraph(f"{html.escape(category)}&nbsp;&nbsp;({len(cat_items)})", section_header_style)]],
+            [[Paragraph(f"{html.escape(category)}&nbsp;&nbsp;({len(cat_items)})",
+                        header_style)]],
             colWidths=[6.9 * inch],
         )
         header.setStyle(TableStyle([
@@ -393,104 +489,83 @@ def write_pdf_digest(items) -> str:
             ("TOPPADDING", (0, 0), (-1, -1), 6),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ]))
-        story.append(header)
-        story.append(Spacer(1, 6))
+        story += [header, Spacer(1, 6)]
 
         for item in cat_items:
-            title = html.escape(item["title"])
-            summary = html.escape(item.get("summary", ""))
-            source = html.escape(item.get("source", "")).upper()
-            link = html.escape(item.get("link", ""), quote=True)
-
-            read_more = (
-                f'<link href="{link}" color="{color_hex}"><b>(Click to Read More)</b></link>'
-                if link else ""
-            )
-
-            story.append(Paragraph(title, headline_style))
-            if summary and read_more:
-                story.append(Paragraph(f"{summary} {read_more}", summary_style))
-            elif read_more:
-                story.append(Paragraph(read_more, summary_style))
-            elif summary:
-                story.append(Paragraph(summary, summary_style))
-            story.append(Paragraph(source, source_style))
-
+            link = html.escape(item["link"], quote=True)
+            read_more = (f'<link href="{link}" color="{color_hex}">'
+                         f'<b>(Read more)</b></link>' if link else "")
+            line = " ".join(x for x in (html.escape(item["summary"]), read_more) if x)
+            story.append(Paragraph(html.escape(item["title"]), headline_style))
+            if line:
+                story.append(Paragraph(line, summary_style))
+            story.append(Paragraph(html.escape(item["source"]).upper(), source_style))
         story.append(Spacer(1, 10))
 
-    if len(story) == 2:  # only the title/date were added - no category sections
-        story.append(Paragraph("No new articles since yesterday.", styles["Normal"]))
+    if len(story) == 2:
+        story.append(Paragraph("No new articles since the last run.", styles["Normal"]))
+    story.append(Paragraph(f"Automated digest &middot; {len(items)} item(s) today",
+                           footer_style))
 
-    story.append(Paragraph(f"Automated digest &middot; {len(items)} new item(s) today", footer_style))
-
-    doc = SimpleDocTemplate(
-        pdf_path, pagesize=letter,
-        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
-        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
-    )
-    doc.build(story)
-
-    return pdf_path
+    SimpleDocTemplate(path, pagesize=letter, topMargin=0.6 * inch,
+                      bottomMargin=0.6 * inch, leftMargin=0.6 * inch,
+                      rightMargin=0.6 * inch).build(story)
+    return path
 
 
-def main():
-    new_items = fetch_new_articles()
-    if new_items:
-        print_digest(new_items)
-        log_articles(new_items)
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+def check_feeds() -> int:
+    """Test every configured feed and report which ones work."""
+    failures = 0
+    for category, feeds in FEEDS.items():
+        print(f"\n{category}")
+        for name, url in feeds.items():
+            entries, error = parse_feed(url)
+            if error:
+                failures += 1
+                print(f"  FAIL  {name:<28} {error}")
+            else:
+                print(f"  OK    {name:<28} {len(entries)} entries")
+    print(f"\n{failures} feed(s) failing.")
+    return failures
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build the daily news digest.")
+    parser.add_argument("--check", action="store_true",
+                        help="test all feeds and exit")
+    parser.add_argument("--reset", action="store_true",
+                        help="clear dedup history before running")
+    args = parser.parse_args()
+
+    if args.check:
+        check_feeds()
+        return
+
+    if args.reset and os.path.exists(SEEN_FILE):
+        os.remove(SEEN_FILE)
+        print("Dedup history cleared.")
+
+    print(f"Fetching {sum(len(f) for f in FEEDS.values())} feeds…")
+    items = fetch_new_articles()
+
+    if items:
+        print_digest(items)
+        log_articles(items)
     else:
-        print("No new articles since last run.")
+        print("\nNo new articles since the last run.")
 
-    # Always write the HTML digest; aborting here would be user-visible.
-    html_path = write_html_digest(new_items)
-    print(f"\nHTML digest saved to: {html_path}")
+    print(f"\nHTML digest: {write_html_digest(items)}")
 
-    # Make PDF generation optional and non-fatal (missing reportlab or other PDF errors
-    # shouldn't make the CI job fail).
     try:
-        pdf_path = write_pdf_digest(new_items)
-        print(f"PDF digest saved to: {pdf_path}")
-    except ModuleNotFoundError as e:
-        # Missing reportlab (or other import) — log and continue.
-        print(f"PDF generation skipped (missing dependency): {e}", file=sys.stderr)
-    except Exception as e:
-        # Any other error in PDF creation — log but don't fail the run.
-        print(f"PDF generation failed but HTML written: {e}", file=sys.stderr)
+        print(f"PDF digest:  {write_pdf_digest(items)}")
+    except ModuleNotFoundError as exc:
+        print(f"PDF skipped (missing dependency): {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"PDF failed, HTML still written: {exc}", file=sys.stderr)
 
 
-# ---------------------------------------------------------------------------
-# AUTOMATING THIS DAILY
-# ---------------------------------------------------------------------------
-#
-# First, install the one dependency:
-#   pip install feedparser
-#
-# --- Linux / macOS (cron) ---
-# Run: crontab -e
-# Add a line to run every day at 7:00 AM:
-#   0 7 * * * /usr/bin/python3 /full/path/to/fetch_commodities_rss.py >> /full/path/to/cron.log 2>&1
-#
-# --- Linux (systemd timer, alternative to cron) ---
-# Create /etc/systemd/system/rss-fetch.service:
-#   [Service]
-#   ExecStart=/usr/bin/python3 /full/path/to/fetch_commodities_rss.py
-# Create /etc/systemd/system/rss-fetch.timer:
-#   [Timer]
-#   OnCalendar=*-*-* 07:00:00
-#   Persistent=true
-#   [Install]
-#   WantedBy=timers.target
-# Then: sudo systemctl enable --now rss-fetch.timer
-#
-# --- Windows (Task Scheduler) ---
-# 1. Open Task Scheduler -> Create Basic Task
-# 2. Trigger: Daily, pick a time
-# 3. Action: Start a program
-#      Program/script: python
-#      Arguments: C:\full\path\to\fetch_commodities_rss.py
-#
-# --- Cloud alternative (no machine needed) ---
-# A free GitHub Actions workflow with a "schedule: cron" trigger can run
-# this script daily and commit the log file back to a repo. Ask if you'd
-# like that workflow file too.
-# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
