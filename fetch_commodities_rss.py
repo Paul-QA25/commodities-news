@@ -440,14 +440,22 @@ def main():
         log_articles(new_items)
     else:
         print("No new articles since last run.")
+
+    # Always write the HTML digest; aborting here would be user-visible.
     html_path = write_html_digest(new_items)
-    pdf_path = write_pdf_digest(new_items)
     print(f"\nHTML digest saved to: {html_path}")
-    print(f"PDF digest saved to: {pdf_path}")
 
-
-if __name__ == "__main__":
-    main()
+    # Make PDF generation optional and non-fatal (missing reportlab or other PDF errors
+    # shouldn't make the CI job fail).
+    try:
+        pdf_path = write_pdf_digest(new_items)
+        print(f"PDF digest saved to: {pdf_path}")
+    except ModuleNotFoundError as e:
+        # Missing reportlab (or other import) — log and continue.
+        print(f"PDF generation skipped (missing dependency): {e}", file=sys.stderr)
+    except Exception as e:
+        # Any other error in PDF creation — log but don't fail the run.
+        print(f"PDF generation failed but HTML written: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
