@@ -1,81 +1,51 @@
-name: Daily Commodities RSS Digest
+# Save as .github/workflows/daily-digest.yml
+name: Daily News Digest
 
-# Runs automatically every day - no manual step required once this is
-# pushed to a GitHub repo. Also allows manual triggering from the
-# "Actions" tab if you ever want to force an early run.
 on:
   schedule:
-    # 03:30 UTC = 09:00 IST. Edit the two numbers "30 3" (minute hour)
-    # to change the time. Cron is always in UTC regardless of your
-    # local timezone.
-    - cron: "30 3 * * *"
-  workflow_dispatch: {}
+    - cron: "30 1 * * *"   # 01:30 UTC = 07:00 IST
+  workflow_dispatch:        # lets you run it manually from the Actions tab
 
 permissions:
-  contents: write  # needed so the workflow can commit the digest back
+  contents: write           # required for the commit step below
 
 jobs:
-  fetch-digest:
+  digest:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run RSS fetch script
-        run: python3 fetch_commodities_rss.py
+      - name: Build digest
+        run: python fetch_news_rss.py
 
-      - name: Determine today's digest filename
-        id: digest
-        run: echo "file=news_digest_$(date -u +%Y-%m-%d).html" >> "$GITHUB_OUTPUT"
-
-      - name: Email the digest
-        uses: dawidd6/action-send-mail@v3
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
         with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Daily News Digest - ${{ steps.digest.outputs.file }}"
-          to: ${{ secrets.MAIL_TO }}
-          from: News Digest Bot
-          # Reads the HTML file's contents directly as the email body -
-          # no attachment, since the digest itself is what you're reading.
-          html_body: file://${{ steps.digest.outputs.file }}
-          content_type: text/html
+          name: news-digest-${{ github.run_number }}
+          path: |
+            news_digest_*.html
+            news_digest_*.pdf
+          if-no-files-found: warn
+          retention-days: 30
 
-      - name: Clean up old digest files
+      - name: Commit dedup state
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # One-time (and ongoing safety) cleanup: remove any leftover .txt
-          # digests from before the switch to HTML. --ignore-unmatch means
-          # this is a safe no-op once none remain, rather than failing.
-          git rm --ignore-unmatch -f commodities_digest_*.txt
-
-          # Keep only the most recent N daily HTML digests so the repo
-          # doesn't accumulate one file per day forever. Raise/lower this
-          # number to keep more or less history.
-          KEEP=30
-          OLD_FILES=$(ls -1 news_digest_*.html 2>/dev/null | sort | head -n -"$KEEP" || true)
-          if [ -n "$OLD_FILES" ]; then
-            git rm -f $OLD_FILES
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen_articles.json news_feed_log.jsonl
+          # `git commit` exits 1 when there is nothing staged, which fails the
+          # whole job on a quiet news day. Only commit if something changed.
+          if git diff --staged --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Digest state $(date -u +%Y-%m-%d)"
+            git push
           fi
-
-      - name: Commit new digest / log files back to the repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add news_digest_*.html commodities_feed_log.jsonl seen_articles.json
-          # Only commit if something actually changed (avoids empty commits
-          # on days with no new articles).
-          git diff --staged --quiet || git commit -m "Daily digest: $(date -u +'%Y-%m-%d')"
-          git push
