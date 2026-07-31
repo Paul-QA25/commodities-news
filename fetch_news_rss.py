@@ -15,9 +15,24 @@ Outputs (written next to this script):
     news_feed_log.jsonl           append-only audit log
     seen_articles.json            dedup state, auto-pruned
 
+It also emails the digest, if the SMTP environment variables below are set.
+Without them the run still succeeds and just writes the files.
+
+    SMTP_USER   full email address to send from      (required)
+    SMTP_PASS   app password, NOT your login password (required)
+    MAIL_TO     recipient(s), comma separated          (required)
+    SMTP_HOST   default smtp.gmail.com
+    SMTP_PORT   default 465 (SSL). Use 587 for STARTTLS.
+    MAIL_FROM   default SMTP_USER
+
+Gmail needs an App Password (Google Account -> Security -> 2-Step
+Verification -> App passwords). A normal account password will be rejected.
+
 Usage:
-    python3 fetch_news_rss.py            # normal run
+    python3 fetch_news_rss.py            # fetch, write files, email if configured
     python3 fetch_news_rss.py --check    # test every feed, print status, exit
+    python3 fetch_news_rss.py --test-email  # send a test mail and exit
+    python3 fetch_news_rss.py --no-email # skip sending
     python3 fetch_news_rss.py --reset    # forget history, start fresh
 
 Dependencies:
@@ -28,11 +43,15 @@ import argparse
 import gzip
 import html
 import json
+import mimetypes
 import os
 import re
+import smtplib
+import ssl
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -514,6 +533,130 @@ def write_pdf_digest(items) -> str:
 
 
 # --------------------------------------------------------------------------
+# Email
+# --------------------------------------------------------------------------
+def smtp_config() -> tuple[dict | None, str | None]:
+    """Read SMTP settings from the environment.
+    Returns (config, reason_it_is_unusable)."""
+    user = os.environ.get("SMTP_USER", "").strip()
+    password = os.environ.get("SMTP_PASS", "").strip()
+    recipients = [a.strip() for a in os.environ.get("MAIL_TO", "").split(",") if a.strip()]
+
+    missing = [name for name, value in
+               (("SMTP_USER", user), ("SMTP_PASS", password), ("MAIL_TO", recipients))
+               if not value]
+    if missing:
+        return None, f"not configured (missing {', '.join(missing)})"
+
+    # GitHub Actions substitutes an empty string for an undefined `vars.X`, so
+    # `os.environ.get(name, default)` would hand back "" instead of the default.
+    host = os.environ.get("SMTP_HOST", "").strip() or "smtp.gmail.com"
+    port_raw = os.environ.get("SMTP_PORT", "").strip() or "465"
+    try:
+        port = int(port_raw)
+    except ValueError:
+        return None, f"SMTP_PORT is not a number: {port_raw!r}"
+
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "sender": os.environ.get("MAIL_FROM", "").strip() or user,
+        "recipients": recipients,
+    }, None
+
+
+def build_message(cfg: dict, subject: str, html_body: str, attachments=()) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = cfg["sender"]
+    message["To"] = ", ".join(cfg["recipients"])
+
+    # Plain-text fallback first, then the HTML alternative. Clients that can't
+    # render HTML (and most spam filters) want to see both.
+    message.set_content(
+        "This digest is formatted in HTML. If you are seeing this line, your "
+        "mail client could not display it — the PDF attachment has the same "
+        "content."
+    )
+    message.add_alternative(html_body, subtype="html")
+
+    for path in attachments:
+        if not path or not os.path.exists(path):
+            continue
+        guessed, _ = mimetypes.guess_type(path)
+        maintype, _, subtype = (guessed or "application/octet-stream").partition("/")
+        with open(path, "rb") as f:
+            message.add_attachment(f.read(), maintype=maintype, subtype=subtype,
+                                   filename=os.path.basename(path))
+    return message
+
+
+def deliver(cfg: dict, message: EmailMessage) -> None:
+    """Open a connection and send. Port 465 is implicit SSL, everything else
+    is treated as STARTTLS (587)."""
+    context = ssl.create_default_context()
+    if cfg["port"] == 465:
+        server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=30, context=context)
+    else:
+        server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=30)
+    with server:
+        if cfg["port"] != 465:
+            server.starttls(context=context)
+        server.login(cfg["user"], cfg["password"])
+        server.send_message(message)
+
+
+def send_digest_email(html_path: str, pdf_path: str | None, item_count: int) -> bool:
+    """Email the digest. Returns True on success, False if it was skipped or
+    failed; the caller decides whether that matters."""
+    cfg, reason = smtp_config()
+    if cfg is None:
+        print(f"Email skipped: {reason}.", file=sys.stderr)
+        return False
+
+    with open(html_path, "r", encoding="utf-8") as f:
+        body = f.read()
+
+    today = datetime.now(timezone.utc)
+    subject = (f"Daily Market Digest — {today:%d %b %Y} ({item_count} item"
+               f"{'s' if item_count != 1 else ''})")
+
+    try:
+        deliver(cfg, build_message(cfg, subject, body, [pdf_path]))
+    except smtplib.SMTPAuthenticationError:
+        print("Email FAILED: the server rejected the login. For Gmail you need "
+              "an App Password, not your account password.", file=sys.stderr)
+        return False
+    except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
+        print(f"Email FAILED: {exc}", file=sys.stderr)
+        return False
+
+    print(f"Email sent to {', '.join(cfg['recipients'])}")
+    return True
+
+
+def send_test_email() -> int:
+    cfg, reason = smtp_config()
+    if cfg is None:
+        print(f"Cannot send test email: {reason}.", file=sys.stderr)
+        return 1
+    print(f"Sending test mail via {cfg['host']}:{cfg['port']} as {cfg['user']}…")
+    message = build_message(
+        cfg, "Digest test email",
+        "<p>If you are reading this, SMTP is configured correctly.</p>",
+    )
+    try:
+        deliver(cfg, message)
+    except Exception as exc:
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+    print(f"Sent to {', '.join(cfg['recipients'])}. Check spam if it doesn't arrive.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 def check_feeds() -> int:
@@ -536,6 +679,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build the daily news digest.")
     parser.add_argument("--check", action="store_true",
                         help="test all feeds and exit")
+    parser.add_argument("--test-email", action="store_true",
+                        help="send a test email and exit")
+    parser.add_argument("--no-email", action="store_true",
+                        help="build the digest but don't send it")
     parser.add_argument("--reset", action="store_true",
                         help="clear dedup history before running")
     args = parser.parse_args()
@@ -543,6 +690,9 @@ def main() -> None:
     if args.check:
         check_feeds()
         return
+
+    if args.test_email:
+        sys.exit(send_test_email())
 
     if args.reset and os.path.exists(SEEN_FILE):
         os.remove(SEEN_FILE)
@@ -557,14 +707,26 @@ def main() -> None:
     else:
         print("\nNo new articles since the last run.")
 
-    print(f"\nHTML digest: {write_html_digest(items)}")
+    html_path = write_html_digest(items)
+    print(f"\nHTML digest: {html_path}")
 
+    pdf_path = None
     try:
-        print(f"PDF digest:  {write_pdf_digest(items)}")
+        pdf_path = write_pdf_digest(items)
+        print(f"PDF digest:  {pdf_path}")
     except ModuleNotFoundError as exc:
         print(f"PDF skipped (missing dependency): {exc}", file=sys.stderr)
     except Exception as exc:
         print(f"PDF failed, HTML still written: {exc}", file=sys.stderr)
+
+    if args.no_email:
+        return
+
+    configured = smtp_config()[0] is not None
+    if not send_digest_email(html_path, pdf_path, len(items)) and configured:
+        # Credentials were supplied but delivery failed — that should surface
+        # as a red run in Actions rather than passing silently.
+        sys.exit(1)
 
 
 if __name__ == "__main__":
