@@ -1,21 +1,26 @@
 # Save as .github/workflows/daily-digest.yml
-name: Daily News Digest
+name: Daily Commodities RSS Digest
 
 on:
   schedule:
-    - cron: "30 1 * * *"   # 01:30 UTC = 07:00 IST
-  workflow_dispatch:        # lets you run it manually from the Actions tab
+    # 03:30 UTC = 09:00 IST. Edit "37 3" (minute hour) to change the time.
+    # Cron here is always UTC. An odd minute is deliberate: runs scheduled on
+    # the hour and half-hour sit in the longest queues and get dropped most.
+    - cron: "37 3 * * *"
+  workflow_dispatch: {}
 
 permissions:
-  contents: write           # required for the commit step below
+  contents: write
 
 jobs:
-  digest:
+  fetch-digest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -23,29 +28,51 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build digest
-        run: python fetch_news_rss.py
+      # The script now emails the digest itself: HTML in the body, PDF
+      # attached only if it exists. That removes the missing-attachment
+      # failure that was killing the old send-mail step.
+      - name: Fetch feeds and email digest
+        env:
+          SMTP_USER: ${{ secrets.MAIL_USERNAME }}
+          SMTP_PASS: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python3 fetch_news_rss.py
 
-      - name: Upload digest
+      # Keep a copy in the Actions run even if the commit step has trouble.
+      - name: Upload digest as an artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: news-digest-${{ github.run_number }}
+          name: digest-${{ github.run_number }}
           path: |
             news_digest_*.html
             news_digest_*.pdf
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Commit dedup state
+      - name: Trim old digests
+        run: |
+          KEEP=30
+          # `git rm` fails hard on files git has never tracked, so ignore
+          # unmatched paths and delete from disk separately.
+          OLD=$( { ls -1 news_digest_*.html news_digest_*.pdf 2>/dev/null || true; } \
+                 | sort | head -n -"$((KEEP * 2))" )
+          if [ -n "$OLD" ]; then
+            git rm --ignore-unmatch -f $OLD || true
+            rm -f $OLD
+          fi
+          git rm --ignore-unmatch -f commodities_digest_*.txt || true
+
+      - name: Commit digest and state files
         run: |
           git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen_articles.json news_feed_log.jsonl
-          # `git commit` exits 1 when there is nothing staged, which fails the
-          # whole job on a quiet news day. Only commit if something changed.
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # --ignore-removal keeps this from failing when a glob matches nothing.
+          git add -A news_digest_*.html news_digest_*.pdf \
+                     news_feed_log.jsonl seen_articles.json 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "Digest state $(date -u +%Y-%m-%d)"
+            git commit -m "Daily digest: $(date -u +'%Y-%m-%d')"
             git push
           fi
