@@ -50,9 +50,11 @@ import smtplib
 import ssl
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -66,8 +68,10 @@ except ModuleNotFoundError:
 # --------------------------------------------------------------------------
 REQUEST_TIMEOUT = 20        # seconds per HTTP attempt
 RETRIES = 2                 # attempts per feed before giving up
-MAX_PER_FEED = 6            # newest N items taken from any single feed
-MAX_PER_CATEGORY = 12       # hard cap per category in the digest
+MAX_PER_FEED = 8            # newest N items considered from any single feed
+CATEGORY_POOL = 8           # candidates kept per category before final ranking
+DIGEST_SIZE = 15            # hard cap on stories in the finished digest
+MIN_PER_CATEGORY = 1        # guarantee each category a slot before topping up
 MAX_AGE_DAYS = 3            # ignore anything older than this
 SEEN_RETENTION_DAYS = 45    # how long a story stays in the dedup memory
 
@@ -105,35 +109,41 @@ FEEDS = {
         "USDA NASS Reports": "https://www.nass.usda.gov/rss/reports.xml",
         "USDA NASS News": "https://www.nass.usda.gov/rss/news.xml",
         "Grains & Oilseeds Wire": gnews(
-            "wheat OR corn OR soybean OR palm oil prices market when:2d"
+            '("wheat prices" OR "corn prices" OR "soybean prices" OR '
+            '"palm oil prices" OR "grain exports") when:2d'
         ),
     },
     "India Agriculture": {
         "BusinessLine Agri-Business":
             "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
         "India Crop & Policy Wire": gnews(
-            "India agriculture monsoon OR sowing OR MSP OR foodgrain when:2d"
+            '(India) ("crop sowing" OR "kharif" OR "rabi" OR '
+            '"minimum support price" OR "foodgrain output" OR '
+            '"monsoon rainfall" OR "farm exports") when:2d'
         ),
     },
     "Precious Metals": {
         # Verified working.
         "Mining.com": "https://www.mining.com/feed/",
         "Gold & Silver Wire": gnews(
-            "gold price OR silver price OR precious metals when:2d"
+            '("gold price" OR "silver price" OR "precious metals" OR '
+            '"gold futures" OR "bullion market") when:2d'
         ),
     },
     "Bullion": {
         "India Bullion Wire": gnews(
-            "India gold imports OR bullion OR MCX gold OR jewellers demand when:2d"
+            '(India) ("gold imports" OR "gold demand" OR "bullion" OR '
+            '"MCX gold" OR "import duty gold" OR "jewellery demand") when:2d'
         ),
     },
     "Global Macro": {
         # Verified working, primary source: the Fed's own feeds.
-        "Fed Monetary Policy": "https://www.federalreserve.gov/feeds/press_monetary.xml",
-        "Fed Speeches & Testimony":
+        "Federal Reserve Policy": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+        "Federal Reserve Speeches":
             "https://www.federalreserve.gov/feeds/speeches_and_testimony.xml",
         "Macro & Rates Wire": gnews(
-            "inflation OR central bank OR interest rates OR dollar index when:2d"
+            '("interest rates" OR "inflation data" OR "central bank" OR '
+            '"dollar index" OR "Fed policy" OR "RBI policy") when:2d'
         ),
     },
 }
@@ -145,6 +155,111 @@ CATEGORY_COLORS = {
     "Bullion": "#A16207",            # dark gold
     "Global Macro": "#6D28D9",       # purple
 }
+
+# Allowlist keyed on DOMAIN, not publisher name. Name matching was too loose —
+# a short key like "pti" or "mint" matches unrelated sites, and it let through
+# things like drishtiias.com that aren't news outlets at all. Google News gives
+# us the publisher's URL alongside the title, so we match on that instead.
+#
+# Tier 1 = global newswires and official bodies; tier 2 = respected national
+# press and specialist commodity trade media. Tier is used as a tie-break so a
+# Reuters story outranks a same-age story from a smaller outlet.
+PROMINENT_DOMAINS = {
+    # --- Tier 1: wires and primary sources ---
+    "reuters.com": 1, "bloomberg.com": 1, "apnews.com": 1, "ft.com": 1,
+    "wsj.com": 1, "economist.com": 1, "nikkei.com": 1,
+    "usda.gov": 1, "federalreserve.gov": 1, "imf.org": 1, "worldbank.org": 1,
+    "fao.org": 1, "rbi.org.in": 1, "pib.gov.in": 1,
+
+    # --- Tier 2: Indian business press ---
+    "business-standard.com": 2, "thehindubusinessline.com": 2,
+    "thehindu.com": 2, "livemint.com": 2, "indiatimes.com": 2,
+    "financialexpress.com": 2, "moneycontrol.com": 2, "indianexpress.com": 2,
+    "hindustantimes.com": 2, "ndtvprofit.com": 2, "ptinews.com": 2,
+    "businesstoday.in": 2, "cnbctv18.com": 2, "zeebiz.com": 2,
+
+    # --- Tier 2: global business press ---
+    "cnbc.com": 2, "bbc.com": 2, "bbc.co.uk": 2, "theguardian.com": 2,
+    "aljazeera.com": 2, "marketwatch.com": 2, "barrons.com": 2,
+    "fortune.com": 2, "forbes.com": 2, "scmp.com": 2, "cnn.com": 2,
+
+    # --- Tier 2: commodity and agriculture trade press ---
+    "spglobal.com": 2, "argusmedia.com": 2, "fastmarkets.com": 2,
+    "kitco.com": 2, "mining.com": 2, "miningweekly.com": 2,
+    "world-grain.com": 2, "agweb.com": 2, "dtnpf.com": 2,
+    "agriculture.com": 2, "farmprogress.com": 2, "agrimoney.com": 2,
+    "chinimandi.com": 2, "palmoilmagazine.com": 2, "world-agri.com": 2,
+    "oilprice.com": 2, "agricensus.com": 2, "krishijagran.com": 2,
+}
+
+
+def domain_of(url: str) -> str:
+    """Bare hostname, lowercased, without a www prefix."""
+    if not url:
+        return ""
+    try:
+        host = urlparse(url).netloc.lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def domain_tier(url: str) -> int:
+    """1 or 2 for an allowlisted domain, 0 otherwise. Subdomains inherit, so
+    economictimes.indiatimes.com matches indiatimes.com."""
+    host = domain_of(url)
+    if not host:
+        return 0
+    for domain, tier in PROMINENT_DOMAINS.items():
+        if host == domain or host.endswith("." + domain):
+            return tier
+    return 0
+
+
+# A prominent outlet still runs lifestyle filler. These headline shapes are
+# never market news, whoever published them.
+OFF_TOPIC_PATTERNS = re.compile(
+    r"\b(best (month|time|day|way) to|how to (grow|plant|make|start|cook)|"
+    r"gardening|home garden|backyard|houseplant|indoor plant|"
+    r"recipe|recipes|horoscope|zodiac|astrology|quiz|"
+    r"weight loss|skin ?care|beauty tips|vastu|"
+    r"here'?s what experts say|things you (should|need to) know|"
+    r"tips for beginners|step[- ]by[- ]step guide)\b",
+    re.IGNORECASE,
+)
+
+# Conversely, a market story almost always names a commodity, a price action,
+# a policy lever, or a trade flow. Wire results must hit at least one of these.
+ON_TOPIC_PATTERNS = re.compile(
+    r"\b(price|prices|pricing|futures|market|markets|rally|rallies|slump|"
+    r"surge|plunge|gain|gains|fall|falls|rise|rises|decline|record high|"
+    r"export|exports|import|imports|tariff|duty|duties|quota|ban|levy|"
+    r"output|production|yield|yields|harvest|sowing|acreage|crop|crops|"
+    r"stocks|stockpile|inventory|inventories|supply|demand|shortage|surplus|"
+    r"msp|procurement|subsidy|subsidies|mandi|arrivals|"
+    r"inflation|interest rate|rate cut|rate hike|monetary|central bank|"
+    r"fed|fomc|rbi|ecb|gdp|dollar|rupee|currency|bond|yield curve|"
+    r"gold|silver|bullion|platinum|palladium|ounce|troy|hallmark|"
+    r"wheat|rice|paddy|corn|maize|soybean|soyoil|soymeal|edible oil|"
+    r"palm oil|sunflower|mustard|rapeseed|canola|sugar|cane|cotton|"
+    r"coffee|cocoa|tea|pulses|chana|tur|onion|potato|"
+    r"crude|oil|gas|energy|freight|"
+    r"monsoon|rainfall|drought|flood|el ni|la ni|weather|"
+    r"mcx|ncdex|comex|cbot|ice futures|exchange|tonne|tonnes|quintal|lakh|"
+    r"trade|trading|forecast|outlook|report|data|usda|wasde)\b",
+    re.IGNORECASE,
+)
+
+
+def topic_verdict(title: str, strict: bool) -> str | None:
+    """Return a rejection reason, or None if the headline should be kept.
+    `strict` requires a positive market signal, used for wire results."""
+    if OFF_TOPIC_PATTERNS.search(title):
+        return "off-topic"
+    if strict and not ON_TOPIC_PATTERNS.search(title):
+        return "no market signal"
+    return None
+
 
 try:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -270,34 +385,41 @@ def parse_feed(url: str):
 
 def source_and_summary(entry, feed_name: str, title: str):
     """Google News wraps items from other publishers, and its summaries are
-    just link markup. Credit the real publisher and drop the noise."""
-    publisher = None
+    just link markup. Credit the real publisher and drop the noise.
+    Returns (publisher_name, summary, title, publisher_url_or_None)."""
+    publisher = publisher_url = None
     source = entry.get("source")
     if isinstance(source, dict):
         publisher = source.get("title")
+        # feedparser exposes <source url="..."> as href.
+        publisher_url = source.get("href") or source.get("url")
 
     if publisher:
         # Google News appends " - Publisher" to every headline; remove it.
         if title.endswith(f" - {publisher}"):
             title = title[: -len(f" - {publisher}")].strip()
-        return publisher, "", title
+        # A publisher_url of "" (not None) still marks this as a wire result,
+        # so a missing URL fails the allowlist rather than bypassing it.
+        return publisher, "", title, (publisher_url or "")
 
     summary = two_liner(clean_html(entry.get("summary", "")))
     # Some feeds echo the headline as the summary; that adds nothing.
     if summary and normalise_title(summary).startswith(normalise_title(title)[:60]):
         summary = ""
-    return feed_name, summary, title
+    # Hand-picked publisher feed: trusted because it's in FEEDS at all.
+    return feed_name, summary, title, None
 
 
-def fetch_new_articles() -> list:
-    seen = load_seen()
+def collect_candidates(seen: dict) -> list:
+    """Gather everything new and worth considering. Ranking and the final cut
+    happen separately in select_top(), so nothing is marked as seen here."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=MAX_AGE_DAYS)
     seen_titles = set()
-    collected = []
+    candidates = []
 
     for category, feeds in FEEDS.items():
-        category_items = []
+        pool = []
 
         for feed_name, url in feeds.items():
             entries, error = parse_feed(url)
@@ -306,6 +428,7 @@ def fetch_new_articles() -> list:
                 continue
 
             taken = 0
+            rejects = Counter()
             for entry in entries:
                 if taken >= MAX_PER_FEED:
                     break
@@ -324,30 +447,119 @@ def fetch_new_articles() -> list:
 
                 title_key = normalise_title(title)
                 if title_key in seen_titles:      # same story, another feed
-                    seen.setdefault(guid, now.isoformat())
                     continue
 
-                publisher, summary, title = source_and_summary(entry, feed_name, title)
+                publisher, summary, title, publisher_url = source_and_summary(
+                    entry, feed_name, title)
+                via_wire = publisher_url is not None
 
-                seen[guid] = now.isoformat()
+                if via_wire:
+                    # Wire result: the publisher's own domain must be listed.
+                    tier = domain_tier(publisher_url)
+                    if tier == 0:
+                        rejects[f"not listed: {domain_of(publisher_url) or publisher}"] += 1
+                        continue
+                else:
+                    # Hand-picked feed, trusted by virtue of being in FEEDS.
+                    tier = domain_tier(entry.get("link", "")) or 2
+
+                # Prominent outlets still run lifestyle filler; wire results
+                # additionally have to look like market news.
+                reason = topic_verdict(title, strict=via_wire)
+                if reason:
+                    rejects[reason] += 1
+                    continue
+
                 seen_titles.add(title_key)
-                category_items.append({
+                pool.append({
                     "category": category,
                     "source": publisher,
                     "title": title,
                     "link": entry.get("link", ""),
                     "published": entry.get("published", ""),
+                    "published_iso": published.isoformat() if published else "",
                     "summary": summary,
                     "guid": guid,
+                    "tier": tier,
                 })
                 taken += 1
 
-            print(f"  [ok]   {category} / {feed_name}: {taken} new")
+            note = ""
+            if rejects:
+                detail = ", ".join(f"{n}x {why}" for why, n in rejects.most_common(3))
+                note = f" ({sum(rejects.values())} rejected — {detail})"
+            print(f"  [ok]   {category} / {feed_name}: {taken} kept{note}")
 
-        collected.extend(category_items[:MAX_PER_CATEGORY])
+        pool.sort(key=story_rank)
+        candidates.extend(pool[:CATEGORY_POOL])
 
-    save_seen(seen)
-    return collected
+    return candidates
+
+
+def story_rank(item: dict) -> tuple:
+    """Sort key: better sources first, then newest first."""
+    published = item.get("published_iso") or ""
+    return (item["tier"], _invert(published))
+
+
+def _invert(iso: str) -> str:
+    """Make a string sort descending — newest timestamps come first."""
+    return "".join(chr(0x10FFFF - ord(c)) if ord(c) < 0x10FFFF else c
+                   for c in iso) if iso else "\uffff"
+
+
+def select_top(candidates: list, limit: int) -> list:
+    """Cut the pool down to `limit` stories, spread across categories.
+
+    Each category gets MIN_PER_CATEGORY slots first so a busy day in Global
+    Macro can't crowd out Bullion entirely; remaining slots go to the
+    best-ranked stories regardless of category.
+    """
+    by_category = {}
+    for item in candidates:
+        by_category.setdefault(item["category"], []).append(item)
+    for pool in by_category.values():
+        pool.sort(key=story_rank)
+
+    chosen, chosen_ids = [], set()
+    counts = {category: 0 for category in by_category}
+
+    # Pass 1: guaranteed slots, in the order categories appear in FEEDS.
+    for category in FEEDS:
+        for item in by_category.get(category, [])[:MIN_PER_CATEGORY]:
+            if len(chosen) < limit:
+                chosen.append(item)
+                chosen_ids.add(item["guid"])
+                counts[item["category"]] += 1
+
+    # Pass 2: best-ranked stories overall, but no category may take more than
+    # its share — one prolific feed shouldn't eat half the digest.
+    ceiling = max(MIN_PER_CATEGORY, round(limit / max(len(FEEDS), 1)) + 1)
+    for item in sorted(candidates, key=story_rank):
+        if len(chosen) >= limit:
+            break
+        if item["guid"] in chosen_ids or counts[item["category"]] >= ceiling:
+            continue
+        chosen.append(item)
+        chosen_ids.add(item["guid"])
+        counts[item["category"]] += 1
+
+    # Pass 3: if quiet categories left slots unused, relax the ceiling rather
+    # than ship a short digest.
+    for item in sorted(candidates, key=story_rank):
+        if len(chosen) >= limit:
+            break
+        if item["guid"] not in chosen_ids:
+            chosen.append(item)
+            chosen_ids.add(item["guid"])
+
+    # Present in category order rather than rank order, so the digest reads
+    # like a newspaper instead of a leaderboard.
+    order = list(FEEDS)
+    chosen.sort(key=lambda i: (order.index(i["category"])
+                               if i["category"] in order else 99,
+                               story_rank(i)))
+    return chosen
 
 
 # --------------------------------------------------------------------------
@@ -710,6 +922,8 @@ def main() -> None:
                         help="build the digest but don't send it")
     parser.add_argument("--reset", action="store_true",
                         help="clear dedup history before running")
+    parser.add_argument("--limit", type=int, default=DIGEST_SIZE,
+                        metavar="N", help=f"stories in the digest (default {DIGEST_SIZE})")
     args = parser.parse_args()
 
     if args.check:
@@ -724,7 +938,18 @@ def main() -> None:
         print("Dedup history cleared.")
 
     print(f"Fetching {sum(len(f) for f in FEEDS.values())} feeds…")
-    items = fetch_new_articles()
+    seen = load_seen()
+    candidates = collect_candidates(seen)
+    items = select_top(candidates, args.limit)
+
+    # Only what actually ships is remembered. A story that just misses the cut
+    # on a busy day stays eligible tomorrow instead of vanishing unread.
+    stamp = datetime.now(timezone.utc).isoformat()
+    for item in items:
+        seen[item["guid"]] = stamp
+    save_seen(seen)
+
+    print(f"\nSelected {len(items)} of {len(candidates)} candidate stories.")
 
     if items:
         print_digest(items)
