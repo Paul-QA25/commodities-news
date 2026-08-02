@@ -72,6 +72,7 @@ MAX_PER_FEED = 8            # newest N items considered from any single feed
 CATEGORY_POOL = 8           # candidates kept per category before final ranking
 DIGEST_SIZE = 15            # hard cap on stories in the finished digest
 MIN_PER_CATEGORY = 1        # guarantee each category a slot before topping up
+MAX_PER_PUBLISHER = 3       # no single outlet may dominate the digest
 MAX_AGE_DAYS = 3            # ignore anything older than this
 SEEN_RETENTION_DAYS = 45    # how long a story stays in the dedup memory
 
@@ -239,7 +240,8 @@ ON_TOPIC_PATTERNS = re.compile(
     r"msp|procurement|subsidy|subsidies|mandi|arrivals|"
     r"inflation|interest rate|rate cut|rate hike|monetary|central bank|"
     r"fed|fomc|rbi|ecb|gdp|dollar|rupee|currency|bond|yield curve|"
-    r"gold|silver|bullion|platinum|palladium|ounce|troy|hallmark|"
+    r"gold|silver|bullion|platinum|palladium|ounce|troy|hallmark\w*|"
+    r"jewell\w*|etf|refiner\w*|"
     r"wheat|rice|paddy|corn|maize|soybean|soyoil|soymeal|edible oil|"
     r"palm oil|sunflower|mustard|rapeseed|canola|sugar|cane|cotton|"
     r"coffee|cocoa|tea|pulses|chana|tur|onion|potato|"
@@ -251,9 +253,44 @@ ON_TOPIC_PATTERNS = re.compile(
 )
 
 
+# Indian outlets publish a "Gold Price Today in <City>" page per city per day,
+# purely for search traffic. They're legitimately-sourced and full of on-topic
+# words, so neither filter above catches them — they need their own test.
+RATE_TABLE_PATTERNS = [
+    # "Gold Price Today in Bellary", "Silver Rate Today in Anantapur"
+    re.compile(r"\b(gold|silver|platinum|petrol|diesel|cng|lpg)\s+"
+               r"(price|rate)s?\s+today\b", re.IGNORECASE),
+    re.compile(r"\btoday'?s\s+(gold|silver|petrol|diesel)\s+(price|rate)", re.IGNORECASE),
+    # Carat tables: "18K, 22K & 24K Rate"
+    re.compile(r"\b(gold|silver)\b.*\b(18|22|24)\s?k\b", re.IGNORECASE),
+    # "1 KG, Silver Price in Trivandrum"
+    re.compile(r"\b1\s?kg\b.*\bsilver\b|\bsilver\b.*\b1\s?kg\b", re.IGNORECASE),
+    re.compile(r"\bcheck\s+(the\s+)?(latest\s+)?(gold|silver)\s+(rate|price)", re.IGNORECASE),
+]
+
+# A spelled-out date inside the headline ("| 02 August 2026", "2nd August
+# 2026") is the giveaway for a daily-refreshed template. Real headlines
+# almost never carry one.
+DATE_IN_TITLE = re.compile(
+    r"\b\d{1,2}(st|nd|rd|th)?\s+"
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+20\d\d\b",
+    re.IGNORECASE,
+)
+PRICE_WORDS = re.compile(r"\b(price|rate|gold|silver)\b", re.IGNORECASE)
+
+
+def looks_like_rate_table(title: str) -> bool:
+    if any(pattern.search(title) for pattern in RATE_TABLE_PATTERNS):
+        return True
+    # Date-stamped price page: "... Silver Price in Trivandrum | 02 August 2026"
+    return bool(DATE_IN_TITLE.search(title) and PRICE_WORDS.search(title))
+
+
 def topic_verdict(title: str, strict: bool) -> str | None:
     """Return a rejection reason, or None if the headline should be kept.
     `strict` requires a positive market signal, used for wire results."""
+    if looks_like_rate_table(title):
+        return "daily rate table"
     if OFF_TOPIC_PATTERNS.search(title):
         return "off-topic"
     if strict and not ON_TOPIC_PATTERNS.search(title):
@@ -523,6 +560,7 @@ def select_top(candidates: list, limit: int) -> list:
 
     chosen, chosen_ids = [], set()
     counts = {category: 0 for category in by_category}
+    by_publisher = Counter()
 
     # Pass 1: guaranteed slots, in the order categories appear in FEEDS.
     for category in FEEDS:
@@ -531,6 +569,7 @@ def select_top(candidates: list, limit: int) -> list:
                 chosen.append(item)
                 chosen_ids.add(item["guid"])
                 counts[item["category"]] += 1
+                by_publisher[item["source"]] += 1
 
     # Pass 2: best-ranked stories overall, but no category may take more than
     # its share — one prolific feed shouldn't eat half the digest.
@@ -538,11 +577,14 @@ def select_top(candidates: list, limit: int) -> list:
     for item in sorted(candidates, key=story_rank):
         if len(chosen) >= limit:
             break
-        if item["guid"] in chosen_ids or counts[item["category"]] >= ceiling:
+        if (item["guid"] in chosen_ids
+                or counts[item["category"]] >= ceiling
+                or by_publisher[item["source"]] >= MAX_PER_PUBLISHER):
             continue
         chosen.append(item)
         chosen_ids.add(item["guid"])
         counts[item["category"]] += 1
+        by_publisher[item["source"]] += 1
 
     # Pass 3: if quiet categories left slots unused, relax the ceiling rather
     # than ship a short digest.
